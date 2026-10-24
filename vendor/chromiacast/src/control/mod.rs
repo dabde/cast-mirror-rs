@@ -3,7 +3,7 @@ mod device_info;
 pub(crate) mod framing;
 pub(crate) mod proto;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -620,7 +620,7 @@ impl CastConnection {
             .map_err(|error| Error::ProtocolError(format!("parse ANSWER: {error}")))
     }
 
-    /// Stop known applications and close the control channel gracefully.
+    /// Stop the applications this connection connected to and close the control channel gracefully.
     ///
     /// The returned error is the terminal result of the control task.
     pub async fn close(self) -> Result<(), Error> {
@@ -790,6 +790,9 @@ where
     let mut pending_product_info = HashMap::<u32, PendingProductInfoRequest>::new();
     let mut pending_offers = HashMap::<u32, PendingOffer>::new();
     let mut known_apps = HashMap::<String, CastApp>::new();
+    // Transports this sender CONNECTed to. RECEIVER_STATUS also lists apps of other senders (e.g. after
+    // a takeover), and the teardown must not stop those.
+    let mut connected = HashSet::<String>::new();
     let mut last_heartbeat = Instant::now();
     let mut heartbeat = interval_at(last_heartbeat + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -968,6 +971,11 @@ where
                         payload,
                         response_sender,
                     }) => {
+                        // Never removed: stop() sends CLOSE before STOP, and if the caller gives up in between,
+                        // the teardown must still STOP our session. A repeated STOP of our own is harmless.
+                        if namespace == NS_CONNECTION && payload.get("type").and_then(Value::as_str) == Some("CONNECT") {
+                            connected.insert(destination.clone());
+                        }
                         match write_json_message_timed(
                             &mut writer,
                             SENDER_ID,
@@ -986,7 +994,7 @@ where
                         }
                     }
                     Some(ControlCommand::Close { response_sender }) => {
-                        let teardown = send_teardown(&mut writer, known_apps.values()).await;
+                        let teardown = send_teardown(&mut writer, known_apps.values().filter(|app| connected.contains(app.transport_id()))).await;
                         let _ = response_sender.send(());
                         match teardown {
                             Ok(()) => break (Ok(()), ControlCloseReason::Requested),
@@ -997,7 +1005,7 @@ where
                         }
                     }
                     None => {
-                        let teardown = send_teardown(&mut writer, known_apps.values()).await;
+                        let teardown = send_teardown(&mut writer, known_apps.values().filter(|app| connected.contains(app.transport_id()))).await;
                         match teardown {
                             Ok(()) => break (Ok(()), ControlCloseReason::Requested),
                             Err(error) => {
@@ -1899,6 +1907,67 @@ mod tests {
             task.await.unwrap(),
             Err(Error::ConnectionFailed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn close_tears_down_only_apps_this_sender_connected_to() {
+        let (client, server) = tokio::io::duplex(8192);
+        let (client_read, client_write) = io::split(client);
+        let (server_read, server_write) = io::split(server);
+        let (command_sender, command_receiver) = mpsc::channel(4);
+        let (event_sender, mut events) = broadcast::channel(4);
+        let task = tokio::spawn(control_loop(
+            FramedReader::new(client_read),
+            FramedWriter::new(client_write),
+            command_receiver,
+            event_sender,
+        ));
+        let mut reader = FramedReader::new(server_read);
+        let mut writer = FramedWriter::new(server_write);
+        let (response_sender, response_receiver) = oneshot::channel();
+        command_sender
+            .send(ControlCommand::SendFire {
+                namespace: NS_CONNECTION.into(),
+                destination: "ours".into(),
+                payload: serde_json::json!({"type": "CONNECT"}),
+                response_sender,
+            })
+            .await
+            .unwrap();
+        reader.read_message().await.unwrap();
+        response_receiver.await.unwrap().unwrap();
+        // Another sender took the receiver over: the status now lists its app too.
+        write_json_message(
+            &mut writer,
+            RECEIVER_ID,
+            SENDER_ID,
+            NS_RECEIVER,
+            &serde_json::json!({"type": "RECEIVER_STATUS", "requestId": 0, "status": {"applications": [
+                {"appId": "0F5096E8", "transportId": "ours", "sessionId": "our-session"},
+                {"appId": "0F5096E8", "transportId": "theirs", "sessionId": "their-session"},
+            ]}}),
+        )
+        .await
+        .unwrap();
+        while !matches!(events.recv().await.unwrap(), ControlEvent::ReceiverStatus(_)) {}
+
+        let (response_sender, response_receiver) = oneshot::channel();
+        command_sender
+            .send(ControlCommand::Close { response_sender })
+            .await
+            .unwrap();
+        response_receiver.await.unwrap();
+        task.await.unwrap().unwrap();
+        let mut teardown = Vec::new();
+        while let Ok(message) = reader.read_message().await {
+            let Payload::String(payload) = message.payload else { continue };
+            teardown.push(format!("{} {payload}", message.destination_id));
+        }
+        assert!(teardown.iter().any(|m| m.contains("our-session")), "{teardown:?}");
+        assert!(
+            !teardown.iter().any(|m| m.starts_with("theirs") || m.contains("their-session")),
+            "{teardown:?}"
+        );
     }
 
     #[tokio::test]

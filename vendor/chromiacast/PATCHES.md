@@ -11,6 +11,10 @@ Upstream candidates; drop the vendor copy once they land.
    openscreen's `SenderImpl::EnqueueFrame` does. Without it the receiver drops every packet that
    arrives before its first SR ("arrived before the first Sender Report"), i.e. the first ~300 ms
    of video and a burst of retransmits. Test: `sender_report_leads_first_frame_until_receiver_report`.
-3. **Test vectors** only: `crypto.rs` `known_answer` (AES-CTR checked against `openssl enc`) and
+3. **Teardown only of our own apps** (`src/control/mod.rs`, `control_loop`): `close()` and drop sent
+   CLOSE and STOP to every app in the last RECEIVER_STATUS, which after a takeover includes the other
+   sender's session, so a sender that lost the receiver also ended the winner's session. Now only
+   transports this connection ever CONNECTed to. Test: `close_tears_down_only_apps_this_sender_connected_to`.
+4. **Test vectors** only: `crypto.rs` `known_answer` (AES-CTR checked against `openssl enc`) and
    `rtcp.rs` `openscreen_vectors` (the 19 packets in `testdata/openscreen_rtcp/`, copied from
    openscreen's `compound_rtcp_parser_fuzzer_seeds`, i.e. what its receiver-side RTCP builder emits).
