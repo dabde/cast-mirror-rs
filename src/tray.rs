@@ -10,7 +10,7 @@ use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tokio::sync::watch;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{CheckMenuItem, IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::mirror::{self, Control, Source};
@@ -40,17 +40,26 @@ const DEFAULT_PROFILE: usize = 1;
 
 enum Ui {
     Menu(MenuEvent),
-    Devices(Vec<(String, String)>),
+    Devices(Vec<Found>),
     Status(String),
     Stopped(Option<String>),
     // Picked in the macOS window picker: id and "app: title".
     Window(u32, String),
 }
 
+/// A Cast receiver from discovery; `tv_app`: our receiver app (android/) is installed, reachable over ADB.
+struct Found {
+    name: String,
+    addr: String,
+    tv_app: bool,
+}
+
+/// One "Receiver" entry: a Cast receiver, or its TV app (direct mode).
 struct Device {
     item: CheckMenuItem,
     name: String,
     addr: String,
+    direct: bool,
 }
 
 /// What gets cast: a display (index as `Capture::start` counts them) or a window.
@@ -71,9 +80,9 @@ impl Target {
 
 /// "Cast screen": one item for one display, a submenu to pick from when there are more.
 struct Screens {
-    single: MenuItem,
+    single: IconMenuItem,
     submenu: Submenu,
-    items: Vec<MenuItem>,
+    items: Vec<IconMenuItem>,
     labels: Vec<String>,
 }
 
@@ -91,7 +100,7 @@ impl Screens {
         let _ = menu.remove(&self.submenu);
         if self.labels.len() > 1 {
             for label in &self.labels {
-                let item = MenuItem::new(label, true, None);
+                let item = icon_item(label, true, if label.starts_with("Built-in") { "laptopcomputer" } else { "display" });
                 let _ = self.submenu.append(&item);
                 self.items.push(item);
             }
@@ -128,14 +137,18 @@ pub fn run() -> Result<()> {
 
     let status = MenuItem::new("Looking for receivers…", false, None);
     let mut screens = Screens {
-        single: MenuItem::new("Cast screen", false, None),
+        single: icon_item("Cast screen", false, "display"),
         submenu: Submenu::new("Cast screen", false),
         items: Vec::new(),
         labels: Vec::new(),
     };
-    let cast_window = MenuItem::new("Cast window…", false, None);
-    let stop_item = MenuItem::new("Stop casting", false, None);
+    screens.submenu.set_icon_templated(symbol("display"));
+    let cast_window = icon_item("Cast window…", false, "macwindow");
+    let stop_item = icon_item("Stop casting", false, "stop.circle");
     let receivers = Submenu::new("Receiver", true);
+    receivers.set_icon_templated(symbol("tv"));
+    let rescan = icon_item("Rescan", true, "arrow.clockwise");
+    receivers.append_items(&[&PredefinedMenuItem::separator(), &rescan])?;
     let profiles: Vec<CheckMenuItem> = PROFILES
         .iter()
         .enumerate()
@@ -144,19 +157,17 @@ pub fn run() -> Result<()> {
     let audio = CheckMenuItem::new("Audio", true, true, None);
     // ScreenCaptureKit records the apps' audio before the output volume, so the TV still gets all of it.
     let mute = CheckMenuItem::new("Mute Mac while casting", true, false, None);
-    let direct = CheckMenuItem::new("Direct to TV app (lowest latency)", true, false, None);
-    let rescan = MenuItem::new("Rescan receivers and screens", true, None);
     // macOS applies a newly granted Screen Recording permission only to a fresh process.
-    let relaunch = MenuItem::new("Restart app", true, None);
-    let quit = MenuItem::new("Quit", true, None);
+    let relaunch = icon_item("Restart app", true, "arrow.triangle.2.circlepath");
+    let quit = icon_item("Quit", true, "power");
     let menu = Menu::new();
     menu.append_items(&[&status, &PredefinedMenuItem::separator(), &cast_window, &stop_item, &receivers])?;
     menu.append(&PredefinedMenuItem::separator())?;
     for p in &profiles {
         menu.append(p)?;
     }
-    menu.append_items(&[&PredefinedMenuItem::separator(), &audio, &mute, &direct])?;
-    menu.append_items(&[&PredefinedMenuItem::separator(), &rescan, &relaunch, &quit])?;
+    menu.append_items(&[&PredefinedMenuItem::separator(), &audio, &mute])?;
+    menu.append_items(&[&PredefinedMenuItem::separator(), &relaunch, &quit])?;
     screens.refresh(&menu);
 
     rt.spawn(scan(proxy.clone()));
@@ -202,14 +213,22 @@ pub fn run() -> Result<()> {
                 for d in devices.drain(..) {
                     let _ = receivers.remove(&d.item);
                 }
-                if selected.as_ref().is_none_or(|s| !found.iter().any(|(n, _)| n == s)) {
-                    selected = found.first().map(|(n, _)| n.clone());
+                for f in found {
+                    let tv_app = f.tv_app.then(|| format!("{} · TV app (lowest latency)", f.name));
+                    devices.push(Device { item: CheckMenuItem::new(&f.name, true, false, None), name: f.name, addr: f.addr.clone(), direct: false });
+                    if let Some(name) = tv_app {
+                        devices.push(Device { item: CheckMenuItem::new(&name, true, false, None), name, addr: f.addr, direct: true });
+                    }
                 }
-                for (name, addr) in found {
-                    let item = CheckMenuItem::new(&name, true, Some(&name) == selected.as_ref(), None);
-                    let _ = receivers.append(&item);
-                    devices.push(Device { item, name, addr });
+                if selected.as_ref().is_none_or(|s| !devices.iter().any(|d| &d.name == s)) {
+                    selected = devices.first().map(|d| d.name.clone());
                 }
+                for (i, d) in devices.iter().enumerate() {
+                    d.item.set_checked(Some(&d.name) == selected.as_ref());
+                    let _ = receivers.insert(&d.item, i);
+                }
+                // Displays come and go like receivers; refresh both on every scan.
+                screens.refresh(&menu);
                 if !casting {
                     status.set_text(if devices.is_empty() { "No receivers found" } else { "Ready" });
                 }
@@ -263,7 +282,6 @@ pub fn run() -> Result<()> {
                     }
                 } else if e.id == *rescan.id() {
                     status.set_text("Looking for receivers…");
-                    screens.refresh(&menu);
                     rt.spawn(scan(proxy.clone()));
                 } else if let Some(i) = profiles.iter().position(|p| e.id == *p.id()) {
                     profile = i;
@@ -271,7 +289,7 @@ pub fn run() -> Result<()> {
                 } else if let Some(d) = devices.iter().find(|d| e.id == *d.item.id()) {
                     selected = Some(d.name.clone());
                     restart = casting;
-                } else if e.id == *audio.id() || e.id == *direct.id() {
+                } else if e.id == *audio.id() {
                     restart = casting;
                 }
                 // Check items toggle themselves; keep exactly one profile and one receiver ticked.
@@ -290,11 +308,12 @@ pub fn run() -> Result<()> {
         }
 
         if begin && stop.is_none() {
-            let (Some(addr), Some(what)) =
-                (devices.iter().find(|d| Some(&d.name) == selected.as_ref()).map(|d| d.addr.clone()), target.clone())
+            let Some((addr, direct)) =
+                devices.iter().find(|d| Some(&d.name) == selected.as_ref()).map(|d| (d.addr.clone(), d.direct))
             else {
                 return;
             };
+            let Some(what) = target.clone() else { return };
             let mut args = Cli::parse_from(["cast-mirror"]).mirror;
             args.device = Some(addr);
             args.delay = PROFILES[profile].delay;
@@ -307,7 +326,6 @@ pub fn run() -> Result<()> {
                 Target::Display(i, _) => args.display = *i,
                 Target::Window(id, _) => args.window = Some(id.to_string()),
             }
-            let direct = direct.is_checked();
             if direct {
                 // HEVC: the TV's MediaTek HEVC decoder buffers less than its H.264 one.
                 args.codecs = vec![crate::Codec::Hevc];
@@ -350,7 +368,8 @@ pub fn run() -> Result<()> {
             }
         }
         // Mute only while audio actually goes to the receiver; direct mode sends none.
-        let want_mute = stop.is_some() && mute.is_checked() && audio.is_checked() && !direct.is_checked();
+        let direct = devices.iter().any(|d| d.direct && Some(&d.name) == selected.as_ref());
+        let want_mute = stop.is_some() && mute.is_checked() && audio.is_checked() && !direct;
         set_output_muted(want_mute, &mut muted_by_us);
         let ready = selected.is_some();
         screens.set_enabled(ready);
@@ -420,22 +439,13 @@ fn relaunch_after_exit() -> Result<()> {
 /// (Re)starts the receiver app (android/) over ADB; network debugging must be enabled on the TV.
 /// `gpu`: draw on the graphics plane (fast, 1080p max) instead of the video plane (4K, ~85 ms slower).
 async fn start_tv_app(host: &str, gpu: bool) -> Result<()> {
-    // Finder-launched apps get a minimal PATH, so look where Homebrew puts adb too.
-    let adb = ["/opt/homebrew/bin/adb", "/usr/local/bin/adb"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or("adb");
     let serial = format!("{host}:5555");
-    // adb can hang on an unreachable TV; never wait longer than 10 s per call.
-    let run = async |args: &[&str]| -> Result<std::process::Output> {
-        let out = tokio::process::Command::new(adb).args(args).kill_on_drop(true).output();
-        Ok(tokio::time::timeout(Duration::from_secs(10), out).await.context("adb timed out")??)
-    };
-    run(&["connect", &serial]).await.context("running adb (brew install --cask android-platform-tools)")?;
+    let ten = Duration::from_secs(10);
+    adb(&["connect", &serial], ten).await.context("running adb (brew install --cask android-platform-tools)")?;
     // -S restarts the activity, so a changed plane choice takes effect.
     let texture = gpu.to_string();
-    let activity = "de.tisth.castmirror/.MainActivity";
-    let out = run(&["-s", &serial, "shell", "am", "start", "-S", "-n", activity, "--ez", "texture", &texture]).await?;
+    let activity = format!("{TV_APP}/.MainActivity");
+    let out = adb(&["-s", &serial, "shell", "am", "start", "-S", "-n", &activity, "--ez", "texture", &texture], ten).await?;
     let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     if !out.status.success() || text.contains("Error") {
         anyhow::bail!("TV app not started on {host}: {}", text.trim());
@@ -445,14 +455,84 @@ async fn start_tv_app(host: &str, gpu: bool) -> Result<()> {
     Ok(())
 }
 
+const TV_APP: &str = "de.tisth.castmirror";
+
+/// Runs adb, which can hang on an unreachable TV, for at most `limit`.
+async fn adb(args: &[&str], limit: Duration) -> Result<std::process::Output> {
+    // Finder-launched apps get a minimal PATH, so look where Homebrew puts adb too.
+    let path = ["/opt/homebrew/bin/adb", "/usr/local/bin/adb"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap_or("adb");
+    let out = tokio::process::Command::new(path).args(args).kill_on_drop(true).output();
+    Ok(tokio::time::timeout(limit, out).await.context("adb timed out")??)
+}
+
+/// Whether the receiver at `host` is an Android TV with network ADB authorized for us and the TV app installed.
+async fn tv_app_installed(host: String) -> bool {
+    let serial = format!("{host}:5555");
+    let limit = Duration::from_secs(3);
+    let stdout = |o: std::process::Output| String::from_utf8_lossy(&o.stdout).into_owned();
+    let connected = adb(&["connect", &serial], limit).await.map(stdout).is_ok_and(|s| s.contains("connected to"));
+    connected
+        && adb(&["-s", &serial, "shell", "pm", "path", TV_APP], limit)
+            .await
+            .map(stdout)
+            .is_ok_and(|s| s.contains("package:"))
+}
+
 async fn scan(proxy: EventLoopProxy<Ui>) {
-    let event = match discover(Duration::from_secs(3)).await {
-        Ok(found) => Ui::Devices(
-            found.iter().map(|d| (d.name().to_string(), d.preferred_endpoint().address().to_string())).collect(),
-        ),
-        Err(e) => Ui::Status(format!("Discovery failed: {e}")),
+    let found = match discover(Duration::from_secs(3)).await {
+        Ok(found) => found,
+        Err(e) => {
+            let _ = proxy.send_event(Ui::Status(format!("Discovery failed: {e}")));
+            return;
+        }
     };
-    let _ = proxy.send_event(event);
+    let checks: Vec<_> = found
+        .iter()
+        .map(|d| tokio::spawn(tv_app_installed(d.preferred_endpoint().address().ip().to_string())))
+        .collect();
+    let mut devices = Vec::new();
+    for (d, check) in found.iter().zip(checks) {
+        let tv_app = check.await.unwrap_or(false);
+        devices.push(Found { name: d.name().to_string(), addr: d.preferred_endpoint().address().to_string(), tv_app });
+    }
+    let _ = proxy.send_event(Ui::Devices(devices));
+}
+
+fn icon_item(text: &str, enabled: bool, symbol_name: &str) -> IconMenuItem {
+    let item = IconMenuItem::new(text, enabled, None, None);
+    item.set_icon_templated(symbol(symbol_name));
+    item
+}
+
+/// An SF Symbol as a template icon, which macOS tints for light and dark menus. Rendered from the
+/// system at runtime, so no Apple artwork ships with the app.
+fn symbol(name: &str) -> Option<tray_icon::menu::Icon> {
+    use objc2_app_kit::{NSImage, NSImageSymbolConfiguration};
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+    use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo};
+    // 18 pt (the tallest a menu icon gets) at 2x.
+    const PX: usize = 36;
+    let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(&objc2_foundation::NSString::from_str(name), None)
+        .or_else(|| {
+            tracing::warn!("no SF Symbol {name:?}");
+            None
+        })?;
+    let image = image.imageWithSymbolConfiguration(&NSImageSymbolConfiguration::configurationWithPointSize_weight(32.0, 0.0))?;
+    let cg = unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) }?;
+    let (w, h) = (CGImage::width(Some(&cg)) as f64, CGImage::height(Some(&cg)) as f64);
+    let mut rgba = vec![0u8; PX * PX * 4];
+    let space = CGColorSpace::new_device_rgb()?;
+    let alpha = CGImageAlphaInfo::PremultipliedLast.0;
+    let ctx = unsafe { CGBitmapContextCreate(rgba.as_mut_ptr().cast(), PX, PX, 8, PX * 4, Some(&space), alpha) }?;
+    let scale = (PX as f64 / w).min(PX as f64 / h);
+    let size = CGSize::new(w * scale, h * scale);
+    let origin = CGPoint::new((PX as f64 - size.width) / 2.0, (PX as f64 - size.height) / 2.0);
+    CGContext::draw_image(Some(&ctx), CGRect::new(origin, size), Some(&cg));
+    drop(ctx);
+    tray_icon::menu::Icon::from_rgba(rgba, PX as u32, PX as u32).ok()
 }
 
 /// 22x22 template icon: a screen outline, filled while casting.
@@ -470,4 +550,15 @@ fn icon(casting: bool) -> Icon {
         }
     }
     Icon::from_rgba(rgba, S as u32, S as u32).expect("valid icon")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn menu_symbols_exist_and_render() {
+        for name in ["display", "laptopcomputer", "macwindow", "stop.circle", "tv", "arrow.clockwise", "arrow.triangle.2.circlepath", "power"] {
+            let icon = super::symbol(name).unwrap_or_else(|| panic!("{name} did not render"));
+            drop(icon);
+        }
+    }
 }
