@@ -116,7 +116,9 @@ complete, then a key frame is requested (at most one per 500 ms). Every 100 ms t
 packets and the minimum one-way delay. The sender cuts the bitrate when the queue grows (> 30 ms, down to 85 % of
 what got through) or loss over 1 s exceeds 10 %, holds at moderate loss (NACK repairs it), and climbs back 2 % per
 report after a calm second. `--auto` (tray profile "Auto") also steps the picture: 1080p60 ≥ 3.5 Mbit/s,
-1080p30 ≥ 2, 720p30 ≥ 1.2, else 540p30; down at once, up after 5 s with 20 % headroom.
+1080p30 ≥ 2, 720p30 ≥ 1.2, else 540p30, starting on the rung `--bitrate` carries; down at once, up after 5 s
+with 20 % headroom. A step up that fails within 10 s doubles that wait (up to 60 s): a static screen leaves the link
+idle, so the bitrate climbs and would otherwise flip between two rungs every few seconds.
 
 Tested without touching the network: `CAST_MIRROR_DROP=0.05` (5 % loss: stays at 1080p60, ~30 NACK repairs/s)
 and `CAST_MIRROR_CAP_KBPS=3000` (queue stays under ~40 ms, settles on 720p30 at ~1.9 Mbit/s).

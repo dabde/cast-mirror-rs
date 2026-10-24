@@ -17,6 +17,7 @@ import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
+import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
@@ -126,6 +127,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     private MediaCodec codec;
     private boolean codecHevc;
 
+    // Feedback is best effort: a failed send (e.g. Wi-Fi briefly gone) must not end the receive loop.
+    private static void send(DatagramSocket socket, byte[] data, int length, SocketAddress to) {
+        try {
+            socket.send(new DatagramPacket(data, length, to));
+        } catch (IOException e) {
+            Log.w(TAG, "feedback not sent: " + e);
+        }
+    }
+
     private void receive(Surface surface) {
         try (DatagramSocket socket = new DatagramSocket(PORT)) {
             socket.setSoTimeout(2);
@@ -210,7 +220,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                             f = new Frame(id, count, flags & 3, now);
                             pending.put(id, f);
                         }
-                        f.put(index, buf, HEADER, n - HEADER);
+                        if (count == f.parts.length) { // A corrupt or foreign packet may disagree on count.
+                            f.put(index, buf, HEADER, n - HEADER);
+                        }
                         newest = Math.max(newest, id);
                     }
                 }
@@ -251,7 +263,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                     }
                     if (missing > 0) {
                         nack.putShort(5, (short) missing);
-                        socket.send(new DatagramPacket(nack.array(), nack.position(), sender));
+                        send(socket, nack.array(), nack.position(), sender);
                         f.nacks++;
                         f.lastNack = now;
                     }
@@ -268,7 +280,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                         if (st[1] < 3 && now - st[0] >= 25) {
                             ByteBuffer nack = ByteBuffer.allocate(7);
                             nack.put((byte) 'N').putInt((int) m).putShort((short) 0xffff);
-                            socket.send(new DatagramPacket(nack.array(), 7, sender));
+                            send(socket, nack.array(), 7, sender);
                             st[0] = now;
                             st[1]++;
                         }
@@ -310,14 +322,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
 
                 if (needKey && now - lastAsk > 200) {
                     Log.i(TAG, "requesting key frame");
-                    socket.send(new DatagramPacket(new byte[] {'K'}, 1, sender));
+                    send(socket, new byte[] {'K'}, 1, sender);
                     lastAsk = now;
                 }
                 if (now - lastReport >= 100 && seqHigh >= 0) {
                     ByteBuffer report = ByteBuffer.allocate(17);
                     report.put((byte) 'R').putInt(received).putInt((int) (seqHigh - seqAtReport));
                     report.putInt(received > 0 ? (int) owdMin : 0).putInt(unrecovered);
-                    socket.send(new DatagramPacket(report.array(), 17, sender));
+                    send(socket, report.array(), 17, sender);
                     lastReport = now;
                     seqAtReport = seqHigh;
                     received = 0;

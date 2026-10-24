@@ -307,7 +307,7 @@ mod tests {
     fn hevc_idr_detected_from_nal_type() {
         // 0x26 = IDR_W_RADL (19) << 1; 0x02 = TRAIL_R (1) << 1.
         let vps = vec![0x40, 1];
-        assert!(avcc_to_annex_b(&avcc(&[&[0x26, 1, 5]]), 4, &[vps.clone()], true).key_frame);
+        assert!(avcc_to_annex_b(&avcc(&[&[0x26, 1, 5]]), 4, std::slice::from_ref(&vps), true).key_frame);
         let delta = avcc_to_annex_b(&avcc(&[&[0x02, 1, 5]]), 4, &[vps], true);
         assert!(!delta.key_frame && delta.data == [0, 0, 0, 1, 0x02, 1, 5]);
     }

@@ -51,8 +51,8 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
     let codec = args.codecs.first().copied().unwrap_or(Codec::H264);
     let hevc = codec == Codec::Hevc;
     let mut rate = RateControl::new(args.bitrate);
-    let mut rung = 0;
-    let (width, fps) = if args.auto { (LADDER[0].0, LADDER[0].1) } else { (args.width, args.fps) };
+    let mut ladder = Ladder::starting_at(rate.bitrate);
+    let (width, fps) = if args.auto { (LADDER[ladder.rung].0, LADDER[ladder.rung].1) } else { (args.width, args.fps) };
     let latest = Arc::new(LatestFrame::default());
     let mut cap = Capture::start(args.display, width, fps, latest.clone(), None)?;
     let mut encoder = VideoEncoder::new(codec, cap.width, cap.height, fps, rate.bitrate)?;
@@ -114,26 +114,34 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
                         let field = |o: usize| u32::from_be_bytes(feedback[o..o + 4].try_into().unwrap());
                         let fb = Report { received: field(1), expected: field(5), owd_ms: field(9) as i32, given_up: field(13) };
                         stats.loss = fb.loss();
-                        if let Some(bitrate) = rate.on_report(Instant::now(), &fb) {
-                            stats.queue_ms = rate.queue_ms;
-                            if args.auto {
-                                let target = rung_for(rung, bitrate, &mut rate.rung_ok_since, Instant::now());
-                                if target != rung {
-                                    rung = target;
-                                    let (w, f, _) = LADDER[rung];
-                                    drop(cap);
-                                    cap = Capture::start(args.display, w, f, latest.clone(), None)?;
-                                    encoder = VideoEncoder::new(codec, cap.width, cap.height, f, bitrate)?;
-                                    encoder.set_max_qp(args.max_qp);
-                                    refresh = Duration::from_secs(1) / f;
-                                    last = None;
-                                    need_key = true;
-                                    info!("auto: {}", describe(&cap, f, bitrate));
-                                }
-                            }
-                            encoder.set_bitrate(bitrate)?;
-                            let f = if args.auto { LADDER[rung].1 } else { fps };
-                            (control.status)(describe(&cap, f, bitrate));
+                        let now = Instant::now();
+                        let changed = rate.on_report(now, &fb).is_some();
+                        stats.queue_ms = rate.queue_ms;
+                        // Every report, not only on a change: pinned at MIN_BITRATE the rate stops changing.
+                        // An empty report says nothing about the link, so it must not count toward a step up.
+                        let empty = fb.received == 0 && fb.expected == 0;
+                        let switched = args.auto && !empty && ladder.update(rate.bitrate, now);
+                        if switched {
+                            let (w, f, _) = LADDER[ladder.rung];
+                            drop(cap);
+                            (cap, encoder) = tokio::task::block_in_place(|| -> Result<_> {
+                                let cap = Capture::start(args.display, w, f, latest.clone(), None)?;
+                                let encoder = VideoEncoder::new(codec, cap.width, cap.height, f, rate.bitrate)?;
+                                Ok((cap, encoder))
+                            })?;
+                            encoder.set_max_qp(args.max_qp);
+                            refresh = Duration::from_secs(1) / f;
+                            last = None;
+                            // A NACK for a frame of the old size would feed it to the new decoder.
+                            history.clear();
+                            need_key = true;
+                            info!("auto: {}", describe(&cap, f, rate.bitrate));
+                        } else if changed {
+                            encoder.set_bitrate(rate.bitrate)?;
+                        }
+                        if changed || switched {
+                            let f = if args.auto { LADDER[ladder.rung].1 } else { fps };
+                            (control.status)(describe(&cap, f, rate.bitrate));
                         }
                     }
                     _ => {}
@@ -142,12 +150,12 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
             }
             _ = report.tick() => {
                 if args.stats {
-                    stats.print(rate.bitrate, args.auto.then_some(rung));
+                    stats.print(rate.bitrate, args.auto.then_some(ladder.rung));
                 }
                 stats = Stats { queue_ms: rate.queue_ms, loss: stats.loss, ..Stats::default() };
                 continue;
             }
-            _ = latest.ready.notified() => match latest.take() {
+            _ = latest.ready.notified() => match latest.take_sized(cap.width, cap.height) {
                 Some(f) => f,
                 None => continue,
             },
@@ -279,7 +287,6 @@ struct RateControl {
     queue_ms: i32,
     last_cut: Option<Instant>,
     calm_since: Option<Instant>,
-    rung_ok_since: Option<Instant>,
 }
 
 impl RateControl {
@@ -292,7 +299,6 @@ impl RateControl {
             queue_ms: 0,
             last_cut: None,
             calm_since: None,
-            rung_ok_since: None,
         }
     }
 
@@ -351,21 +357,47 @@ impl RateControl {
     }
 }
 
-/// Next rung: down as soon as the bitrate no longer carries this one, up after 5 s with 20 % headroom.
-fn rung_for(rung: usize, bitrate: u32, ok_since: &mut Option<Instant>, now: Instant) -> usize {
-    if bitrate < LADDER[rung].2 {
-        *ok_since = None;
-        return (rung + 1).min(LADDER.len() - 1);
+/// Position on LADDER: down as soon as the bitrate no longer carries a rung, up after a hold time
+/// with 20 % headroom.
+struct Ladder {
+    rung: usize,
+    ok_since: Option<Instant>,
+    hold: Duration,
+    last_up: Option<Instant>,
+}
+
+impl Ladder {
+    /// The best rung this bitrate carries.
+    fn starting_at(bitrate: u32) -> Self {
+        let rung = LADDER.iter().position(|r| bitrate >= r.2).unwrap_or(LADDER.len() - 1);
+        Self { rung, ok_since: None, hold: Duration::from_secs(5), last_up: None }
     }
-    if rung > 0 && bitrate as f64 >= LADDER[rung - 1].2 as f64 * 1.2 {
-        if now - *ok_since.get_or_insert(now) >= Duration::from_secs(5) {
-            *ok_since = None;
-            return rung - 1;
+
+    /// Returns whether the rung changed.
+    fn update(&mut self, bitrate: u32, now: Instant) -> bool {
+        if bitrate < LADDER[self.rung].2 && self.rung < LADDER.len() - 1 {
+            // A static screen leaves the link idle, so the bitrate climbs and the ladder steps up until
+            // the next key frame burst proves otherwise; back off instead of flipping every few seconds.
+            // ponytail: the hold never shrinks again, add a decay if long sessions need it.
+            if self.last_up.take().is_some_and(|t| now - t < Duration::from_secs(10)) {
+                self.hold = (self.hold * 2).min(Duration::from_secs(60));
+            }
+            self.rung += 1;
+            self.ok_since = None;
+            return true;
         }
-    } else {
-        *ok_since = None;
+        if self.rung > 0 && bitrate as f64 >= LADDER[self.rung - 1].2 as f64 * 1.2 {
+            if now - *self.ok_since.get_or_insert(now) >= self.hold {
+                self.rung -= 1;
+                self.ok_since = None;
+                self.last_up = Some(now);
+                return true;
+            }
+        } else {
+            self.ok_since = None;
+        }
+        false
     }
-    rung
 }
 
 #[derive(Default)]
@@ -445,10 +477,30 @@ mod tests {
     #[test]
     fn ladder_steps_down_at_once_and_up_after_five_seconds() {
         let t0 = Instant::now();
-        let mut ok = None;
-        assert_eq!(rung_for(0, 3_000_000, &mut ok, t0), 1);
-        assert_eq!(rung_for(1, 5_500_000, &mut ok, t0), 1, "headroom, but not for 5 s yet");
-        assert_eq!(rung_for(1, 5_500_000, &mut ok, t0 + Duration::from_secs(5)), 0);
-        assert_eq!(rung_for(3, 100_000, &mut ok, t0), 3, "bottom rung stays");
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut l = Ladder::starting_at(6_000_000);
+        assert!(l.update(3_000_000, t0) && l.rung == 1);
+        assert!(!l.update(5_500_000, t0), "headroom, but not for 5 s yet");
+        assert!(l.update(5_500_000, at(5)) && l.rung == 0);
+        for _ in 0..5 {
+            l.update(100_000, at(6));
+        }
+        assert_eq!(l.rung, 3, "one rung per report, bottom rung stays");
+        assert_eq!(Ladder::starting_at(1_000_000).rung, 3, "--bitrate 1M starts low, no restarts");
+    }
+
+    #[test]
+    fn ladder_waits_longer_after_a_failed_step_up() {
+        let t0 = Instant::now();
+        let at = |s| t0 + Duration::from_secs(s);
+        let mut l = Ladder::starting_at(2_500_000);
+        l.update(5_500_000, t0);
+        assert!(l.update(5_500_000, at(5)) && l.rung == 0);
+        assert!(l.update(3_000_000, at(8)) && l.rung == 1, "step up failed within 10 s");
+        l.update(1_000_000, at(8));
+        assert_eq!(l.hold, Duration::from_secs(10), "walking further down doubles only once");
+        l.update(5_500_000, at(9));
+        assert!(!l.update(5_500_000, at(14)), "now holds 10 s");
+        assert!(l.update(5_500_000, at(19)) && l.rung == 1);
     }
 }

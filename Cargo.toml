@@ -16,7 +16,7 @@ objc2-video-toolbox = "0.3.2"
 opus = "0.4.0"
 screencapturekit = "8"
 tao = "0.37.2"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "process"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tray-icon = "0.26.1"

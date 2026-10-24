@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use chromiacast::{
-    AudioCodec, AudioStreamConfig, ControlEvent, EncodedFrame, EnqueueError, FrameDependency, Framerate, Offer,
+    AudioCodec, AudioStreamConfig, CastApp, CastConnection, ControlEvent, EncodedFrame, EnqueueError, FrameDependency, Framerate, Offer,
     Resolution, SenderEvent, SenderSession, StreamHandle, StreamStatistics, UdpTransport, VideoCodec,
     VideoStreamConfig,
 };
@@ -24,7 +24,8 @@ const MIN_VIDEO_BITRATE: u32 = 500_000;
 // The receiver must see something at least this often, even on a static screen.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
-// A second loss this soon means another sender (e.g. another laptop) is fighting over the receiver.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+// A reconnected session lost again this soon means another sender (e.g. another laptop) is fighting over the receiver.
 const LOSS_WINDOW: Duration = Duration::from_secs(30);
 // Longest we skip frames while the receiver looks behind.
 const STALL: Duration = Duration::from_millis(250);
@@ -73,25 +74,50 @@ pub async fn run(args: MirrorArgs, source: Source, control: Control) -> Result<(
         capture::ensure_permission()?;
     }
     let addr = resolve(args.device.as_deref()).await?;
-    let mut last_loss: Option<Instant> = None;
+    #[cfg(feature = "test-receiver")]
+    let unverified = args.unverified;
+    #[cfg(not(feature = "test-receiver"))]
+    let unverified = false;
+    let mut reconnected = false;
     loop {
         (control.status)(format!("Connecting to {addr}"));
-        match session(&args, source, addr, &control).await {
-            Ok(End::Stopped) => return Ok(()),
-            Ok(End::TakenOver) => bail!("receiver taken over by another sender, Start to take it back"),
-            Ok(End::Lost(e)) | Err(e) => {
-                if last_loss.is_some_and(|t| t.elapsed() < LOSS_WINDOW) {
-                    warn!("session ended again: {e:#}; not reconnecting");
-                    bail!("receiver lost twice in {}s, another sender casting? Start to take it back", LOSS_WINDOW.as_secs());
+        let launched = tokio::select! {
+            launched = connect_and_launch(addr, unverified) => launched,
+            _ = control.stopped() => return Ok(()),
+        };
+        let e = match launched {
+            // Receiver unreachable: keep retrying, that is not a loss.
+            Err(e) => e,
+            Ok((connection, app)) => {
+                let began = Instant::now();
+                let end = session(&args, source, addr, &control, &connection, &app).await.unwrap_or_else(End::Lost);
+                let lasted = began.elapsed();
+                // After a loss the receiver may already run another sender's session, and STOP would end that one.
+                // Bounded: a half-dead receiver must not keep Stop or Quit waiting.
+                if matches!(end, End::Stopped) {
+                    let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, connection.stop(&app)).await;
                 }
-                last_loss = Some(Instant::now());
-                warn!("session ended: {e:#}; reconnecting in {RECONNECT_DELAY:?}");
-                (control.status)(format!("Reconnecting: {e}"));
-                tokio::select! {
-                    _ = tokio::time::sleep(RECONNECT_DELAY) => {}
-                    _ = control.stopped() => return Ok(()),
+                let _ = tokio::time::timeout(TEARDOWN_TIMEOUT, connection.close()).await;
+                match end {
+                    End::Stopped => return Ok(()),
+                    End::TakenOver => bail!("receiver taken over by another sender, Start to take it back"),
+                    // A reconnect that fails again quickly means fighting, not a glitch.
+                    End::Lost(e) if reconnected && lasted < LOSS_WINDOW => {
+                        warn!("session ended again: {e:#}; not reconnecting");
+                        bail!("receiver lost twice in {}s ({e}); another sender casting? Start to take it back", LOSS_WINDOW.as_secs());
+                    }
+                    End::Lost(e) => {
+                        reconnected = true;
+                        e
+                    }
                 }
             }
+        };
+        warn!("{e:#}; reconnecting in {RECONNECT_DELAY:?}");
+        (control.status)(format!("Reconnecting: {e}"));
+        tokio::select! {
+            _ = tokio::time::sleep(RECONNECT_DELAY) => {}
+            _ = control.stopped() => return Ok(()),
         }
     }
 }
@@ -99,6 +125,10 @@ pub async fn run(args: MirrorArgs, source: Source, control: Control) -> Result<(
 /// Resolves once the receiver no longer runs our app session.
 async fn app_gone(mut events: tokio::sync::broadcast::Receiver<ControlEvent>, ours: String) {
     use tokio::sync::broadcast::error::RecvError;
+    if ours.is_empty() {
+        // Nothing to compare against: every status would look like a takeover.
+        return std::future::pending().await;
+    }
     loop {
         match events.recv().await {
             Ok(ControlEvent::ApplicationStopped(app)) if app.session_id() == ours => return,
@@ -112,7 +142,14 @@ async fn app_gone(mut events: tokio::sync::broadcast::Receiver<ControlEvent>, ou
     }
 }
 
-async fn session(args: &MirrorArgs, source: Source, addr: std::net::SocketAddr, control: &Control) -> Result<End> {
+async fn session(
+    args: &MirrorArgs,
+    source: Source,
+    addr: std::net::SocketAddr,
+    control: &Control,
+    connection: &CastConnection,
+    app: &CastApp,
+) -> Result<End> {
     let origin = Instant::now();
     let latest = Arc::new(LatestFrame::default());
     let (audio_tx, audio_rx) = mpsc::channel(64);
@@ -126,11 +163,6 @@ async fn session(args: &MirrorArgs, source: Source, addr: std::net::SocketAddr, 
     let (mut width, mut height) =
         capture.as_ref().map_or((args.width & !1, (args.width * 9 / 16) & !1), |c| (c.width, c.height));
 
-    #[cfg(feature = "test-receiver")]
-    let unverified = args.unverified;
-    #[cfg(not(feature = "test-receiver"))]
-    let unverified = false;
-    let (connection, app) = connect_and_launch(addr, unverified).await?;
     let mut taken_over = std::pin::pin!(app_gone(connection.subscribe(), app.session_id().to_owned()));
     let delay = Duration::from_millis(args.delay);
     let mut builder = Offer::builder().android_rtp_hack(!args.spec_payload_types);
@@ -160,7 +192,7 @@ async fn session(args: &MirrorArgs, source: Source, addr: std::net::SocketAddr, 
         });
     }
     let offer = builder.build()?;
-    let answer = connection.exchange_offer(&offer, &app).await.context("OFFER/ANSWER")?;
+    let answer = connection.exchange_offer(&offer, app).await.context("OFFER/ANSWER")?;
     info!(?answer, "receiver ANSWER");
     let codec = answer
         .send_indexes
@@ -183,7 +215,10 @@ async fn session(args: &MirrorArgs, source: Source, addr: std::net::SocketAddr, 
                 info!("receiver caps video at {}x{}; capturing {width}x{height}", dims.width, dims.height);
                 if source == Source::Screen {
                     drop(capture.take());
-                    capture = Some(Capture::start(args.display, width, fps, latest.clone(), audio_tx.clone())?);
+                    let c = Capture::start(args.display, width, fps, latest.clone(), audio_tx.clone())?;
+                    // Capture fits its own 16:9 box; encode exactly what it delivers.
+                    (width, height) = (c.width, c.height);
+                    capture = Some(c);
                 }
             }
         }
@@ -211,10 +246,13 @@ async fn session(args: &MirrorArgs, source: Source, addr: std::net::SocketAddr, 
         last_sent: Instant::now(),
         behind_since: None,
     };
-    let pattern = [(81, 90, 240), (145, 54, 34), (41, 240, 110), (235, 128, 128)]
-        .map(|c| solid_frame(width, height, c))
-        .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+    let pattern = match source {
+        Source::Pattern => [(81, 90, 240), (145, 54, 34), (41, 240, 110), (235, 128, 128)]
+            .map(|c| solid_frame(width, height, c))
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?,
+        Source::Screen => Vec::new(),
+    };
     let mut last: Option<capture::Frame> = None;
     let mut ticker = tokio::time::interval(Duration::from_secs(1) / fps);
     let mut report = tokio::time::interval(Duration::from_secs(1));
@@ -223,37 +261,45 @@ async fn session(args: &MirrorArgs, source: Source, addr: std::net::SocketAddr, 
     // One future for the whole session: re-creating it per iteration can miss a stop sent mid-frame.
     let stopped = control.stopped();
     tokio::pin!(stopped);
-    let end = loop {
-        tokio::select! {
-            _ = &mut stopped => break End::Stopped,
-            _ = &mut taken_over => break End::TakenOver,
-            result = &mut lost => break End::Lost(result.unwrap_or_else(|e| anyhow!(e))),
-            _ = report.tick() => {
-                let stats = sender.statistics().await?;
-                if let Some(v) = stats.video.as_ref() {
-                    if let Some(bitrate) = pipeline.rate.update(v) {
-                        pipeline.encoder.set_bitrate(bitrate)?;
-                    }
-                    if args.stats {
-                        pipeline.stats.print(v, pipeline.rate.bitrate);
+    let end = match async {
+        loop {
+            tokio::select! {
+                _ = &mut stopped => break Ok(End::Stopped),
+                _ = &mut taken_over => break Ok(End::TakenOver),
+                result = &mut lost => break Ok(End::Lost(result.unwrap_or_else(|e| anyhow!(e)))),
+                _ = report.tick() => {
+                    let stats = sender.statistics().await?;
+                    if let Some(v) = stats.video.as_ref() {
+                        if let Some(bitrate) = pipeline.rate.update(v) {
+                            pipeline.encoder.set_bitrate(bitrate)?;
+                        }
+                        if args.stats {
+                            pipeline.stats.print(v, pipeline.rate.bitrate);
+                        }
                     }
                 }
-            }
-            _ = ticker.tick(), if source == Source::Pattern => {
-                let colour = &pattern[(origin.elapsed().as_secs() % 4) as usize];
-                pipeline.send(colour, Instant::now(), &sender).await?;
-            }
-            _ = latest.ready.notified(), if source == Source::Screen => {
-                if let Some(frame) = latest.take() {
-                    pipeline.send(frame.image(), frame.captured_at, &sender).await?;
-                    last = Some(frame);
+                _ = ticker.tick(), if source == Source::Pattern => {
+                    let colour = &pattern[(origin.elapsed().as_secs() % 4) as usize];
+                    pipeline.send(colour, Instant::now(), &sender).await?;
                 }
-            }
-            _ = tokio::time::sleep_until((pipeline.last_sent + REFRESH_INTERVAL).into()), if source == Source::Screen && last.is_some() => {
-                let frame = last.clone().unwrap();
-                pipeline.send(frame.image(), Instant::now(), &sender).await?;
+                _ = latest.ready.notified(), if source == Source::Screen => {
+                    if let Some(frame) = latest.take_sized(width, height) {
+                        pipeline.send(frame.image(), frame.captured_at, &sender).await?;
+                        last = Some(frame);
+                    }
+                }
+                _ = tokio::time::sleep_until((pipeline.last_sent + REFRESH_INTERVAL).into()), if source == Source::Screen && last.is_some() => {
+                    let frame = last.clone().unwrap();
+                    pipeline.send(frame.image(), Instant::now(), &sender).await?;
+                }
             }
         }
+    }
+    .await
+    {
+        Ok(end) => end,
+        // An error mid-session still needs the teardown below, then a reconnect.
+        Err(e) => End::Lost(e),
     };
 
     if audio_task.is_some() {
@@ -270,11 +316,6 @@ async fn session(args: &MirrorArgs, source: Source, addr: std::net::SocketAddr, 
         tokio::time::sleep(delay.max(MIN_AUDIO_DELAY) + Duration::from_millis(150)).await;
     }
     let _ = sender.shutdown().await;
-    // After a loss the receiver may already run another sender's session, and STOP would end that one.
-    if matches!(end, End::Stopped) {
-        let _ = connection.stop(&app).await;
-    }
-    let _ = connection.close().await;
     Ok(end)
 }
 
@@ -366,6 +407,8 @@ impl Pipeline {
         if let Some(prev) = self.last_pts.filter(|p| pts <= *p) {
             pts = prev + Duration::from_millis(1);
         }
+        // Also when the frame gets dropped below, or the refresh timer fires again at once and spins.
+        self.last_sent = Instant::now();
         let force_key = self.need_key.swap(false, Ordering::AcqRel);
         let encoded = tokio::task::block_in_place(|| self.encoder.encode(image, pts, force_key))?;
         let Some(encoded) = encoded else {
@@ -377,7 +420,7 @@ impl Pipeline {
         self.stats.bytes += encoded.data.len() as u64;
         let frame = EncodedFrame::new(dependency, Bytes::from(encoded.data), pts, self.origin + pts);
         match self.video.send(frame).await {
-            Ok(_) => (self.last_pts, self.last_sent) = (Some(pts), Instant::now()),
+            Ok(_) => self.last_pts = Some(pts),
             // The receiver will not get the reference chain; restart it with an IDR.
             Err(EnqueueError::ReachedIdSpanLimit) => self.need_key.store(true, Ordering::Release),
             Err(e) => {
@@ -426,7 +469,11 @@ async fn send_audio(audio: StreamHandle, mut rx: mpsc::Receiver<capture::AudioCh
         };
         if chunk.captured_at.elapsed() > STALE_AUDIO {
             tracing::debug!("stale audio chunk dropped ({:?} old)", chunk.captured_at.elapsed());
+            framer.gap();
             continue;
+        }
+        if chunk.after_gap {
+            framer.gap();
         }
         if fade.load(Ordering::Acquire) {
             framer.fade_out();
@@ -471,7 +518,8 @@ impl RateControl {
         let retx = s.packets_retransmitted.saturating_sub(self.retransmitted);
         let sent = s.packets_sent.saturating_sub(self.sent).max(1);
         (self.retransmitted, self.sent) = (s.packets_retransmitted, s.packets_sent);
-        let lossy = s.fraction_lost.unwrap_or(0) > 5 || retx * 50 > sent;
+        // fraction_lost is RTCP's 8-bit fixed point: 13/256 = 5 %.
+        let lossy = s.fraction_lost.unwrap_or(0) >= 13 || retx * 20 > sent;
         let backlog = s.in_flight_media_duration * 2 > s.max_acceptable_in_flight_duration;
         let next = if lossy || backlog {
             (self.bitrate as f64 * 0.8) as u32
@@ -530,10 +578,12 @@ mod tests {
     fn rate_backs_off_on_loss_and_recovers() {
         let mut rc = RateControl::new(6_000_000);
         assert_eq!(rc.update(&stats(1000, 0, 0, 0)), None, "already at max");
-        assert_eq!(rc.update(&stats(2000, 100, 0, 0)), Some(4_800_000), "5% retransmits");
-        assert_eq!(rc.update(&stats(3000, 100, 30, 0)), Some(3_840_000), "receiver loss");
-        assert_eq!(rc.update(&stats(4000, 100, 0, 80)), Some(3_072_000), "backlog");
-        assert_eq!(rc.update(&stats(5000, 100, 0, 0)), Some(3_372_000), "additive increase");
+        assert_eq!(rc.update(&stats(2000, 30, 0, 0)), None, "3% retransmits is normal Wi-Fi");
+        assert_eq!(rc.update(&stats(3000, 60, 6, 0)), None, "2% receiver loss too");
+        assert_eq!(rc.update(&stats(4000, 130, 0, 0)), Some(4_800_000), "7% retransmits");
+        assert_eq!(rc.update(&stats(5000, 130, 30, 0)), Some(3_840_000), "12% receiver loss");
+        assert_eq!(rc.update(&stats(6000, 130, 0, 80)), Some(3_072_000), "backlog");
+        assert_eq!(rc.update(&stats(7000, 130, 0, 0)), Some(3_372_000), "additive increase");
     }
 
     #[test]

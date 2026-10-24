@@ -1,12 +1,13 @@
 //! Screen and system-audio capture via ScreenCaptureKit.
 
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use objc2_core_foundation::CFRetained;
-use objc2_core_video::{CVImageBuffer, CVPixelBuffer};
+use objc2_core_video::{CVImageBuffer, CVPixelBuffer, CVPixelBufferGetHeight, CVPixelBufferGetWidth};
 use screencapturekit::cm::{CMSampleBuffer, CMSampleBufferExt, CMSampleBufferSCExt, CMTime, SCFrameStatus};
 use screencapturekit::prelude::*;
 use tokio::sync::{mpsc, Notify};
@@ -38,6 +39,10 @@ impl Frame {
     pub fn image(&self) -> &CVImageBuffer {
         &self.image
     }
+
+    pub fn size(&self) -> (u32, u32) {
+        (CVPixelBufferGetWidth(&self.image) as u32, CVPixelBufferGetHeight(&self.image) as u32)
+    }
 }
 
 /// Only the newest frame is kept: a slow consumer skips frames instead of queueing them.
@@ -45,11 +50,28 @@ impl Frame {
 pub struct LatestFrame {
     slot: Mutex<Option<Frame>>,
     pub ready: Notify,
+    skipped: AtomicU32,
 }
 
 impl LatestFrame {
-    pub fn take(&self) -> Option<Frame> {
+    fn take(&self) -> Option<Frame> {
         self.slot.lock().unwrap().take()
+    }
+
+    /// The newest frame if it has this size: after a capture restart, a frame of the old stream
+    /// may still arrive and must not reach the new encoder.
+    pub fn take_sized(&self, width: u32, height: u32) -> Option<Frame> {
+        let frame = self.take()?;
+        let size = frame.size();
+        if size != (width, height) {
+            // One straggler per restart is normal; a run of them means capture never matches: say so.
+            if self.skipped.fetch_add(1, Ordering::Relaxed) + 1 == 30 {
+                tracing::warn!("capture delivers {size:?} frames, expected {width}x{height}; nothing is sent");
+            }
+            return None;
+        }
+        self.skipped.store(0, Ordering::Relaxed);
+        Some(frame)
     }
 }
 
@@ -57,6 +79,8 @@ impl LatestFrame {
 pub struct AudioChunk {
     pub samples: Vec<f32>,
     pub captured_at: Instant,
+    // Chunks before this one were dropped.
+    pub after_gap: bool,
 }
 
 pub struct Capture {
@@ -128,12 +152,15 @@ impl Capture {
             SCStreamOutputType::Screen,
         );
         if let Some(tx) = audio {
+            let dropped = AtomicBool::new(false);
             stream.add_output_handler(
                 move |sample: CMSampleBuffer, _| {
                     if let Some(samples) = interleave(&sample) {
+                        let after_gap = dropped.swap(false, Ordering::Relaxed);
                         // Dropping audio beats building latency when the sender stalls.
-                        if tx.try_send(AudioChunk { samples, captured_at: Instant::now() }).is_err() {
+                        if tx.try_send(AudioChunk { samples, captured_at: Instant::now(), after_gap }).is_err() {
                             tracing::debug!("audio chunk dropped: sender queue full");
+                            dropped.store(true, Ordering::Relaxed);
                         }
                     }
                 },
@@ -172,6 +199,7 @@ fn interleave(sample: &CMSampleBuffer) -> Option<Vec<f32>> {
         [mono] => Some(mono.iter().flat_map(|s| [*s, *s]).collect()),
         [] => None,
     }
+    .filter(|s: &Vec<f32>| !s.is_empty())
 }
 
 #[cfg(test)]

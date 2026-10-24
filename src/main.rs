@@ -49,7 +49,7 @@ enum Command {
 pub struct MirrorArgs {
     /// Name (substring), id or IP address; default: first receiver found.
     pub device: Option<String>,
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u32).range(1..=240))]
     pub fps: u32,
     /// Start/max video bitrate, e.g. 6M or 4500k.
     #[arg(long, default_value = "6M", value_parser = parse_bitrate)]
@@ -157,6 +157,8 @@ fn main() -> Result<()> {
         let log = std::env::home_dir().unwrap_or_default().join("Library/Logs/CastMirror.log");
         let file = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
         tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(file).init();
+        // The default hook writes to stderr, which nobody sees in the menu bar app.
+        std::panic::set_hook(Box::new(|info| tracing::error!("{info}")));
     } else {
         tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
     }
@@ -186,7 +188,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 app.session_id(),
                 app.transport_id()
             );
-            connection.close().await?;
+            // close() or a drop would STOP the app again; the process exits right after, closing the socket.
+            std::mem::forget(connection);
             Ok(())
         }
         Some(Command::Stop { device }) => {

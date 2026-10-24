@@ -135,6 +135,7 @@ pub fn run() -> Result<()> {
                 }
                 if quitting {
                     *flow = ControlFlow::Exit;
+                    return;
                 }
                 begin = std::mem::take(&mut restart);
                 if begin {
@@ -186,7 +187,7 @@ pub fn run() -> Result<()> {
                 }
                 if restart && let Some(tx) = &stop {
                     let _ = tx.send(true);
-                    status.set_text("Restarting with new settings…");
+                    status.set_text("Restarting…");
                 }
             }
             _ => {}
@@ -222,16 +223,22 @@ pub fn run() -> Result<()> {
             let done = proxy.clone();
             // Like the CLI: block_on on its own thread, as the session holds non-Send CoreVideo buffers.
             std::thread::spawn(move || {
-                let result = tokio::runtime::Runtime::new().map_err(anyhow::Error::from).and_then(|rt| {
-                    if direct {
-                        (control.status)("Starting the TV app over ADB…".into());
-                        // The TV's graphics plane is 1080p: above that, use the (slower) 4K video plane.
-                        start_tv_app(args.device.as_deref().unwrap_or_default(), args.width <= 1920)?;
-                        rt.block_on(crate::direct::run(args, control))
-                    } else {
-                        rt.block_on(mirror::run(args, Source::Screen, control))
-                    }
-                });
+                let session = || -> Result<()> {
+                    let rt = tokio::runtime::Runtime::new()?;
+                    rt.block_on(async {
+                        if direct {
+                            (control.status)("Starting the TV app over ADB…".into());
+                            // The TV's graphics plane is 1080p: above that, use the (slower) 4K video plane.
+                            start_tv_app(args.device.as_deref().unwrap_or_default(), args.width <= 1920).await?;
+                            crate::direct::run(args, control).await
+                        } else {
+                            mirror::run(args, Source::Screen, control).await
+                        }
+                    })
+                };
+                // A panic must still report Stopped, or the menu stays on "Stop casting" and Quit waits forever.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(session))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("session crashed, see the log")));
                 let _ = done.send_event(Ui::Stopped(result.err().map(|e| format!("Error: {e:#}"))));
             });
             stop = Some(tx);
@@ -246,25 +253,29 @@ pub fn run() -> Result<()> {
 
 /// (Re)starts the receiver app (android/) over ADB; network debugging must be enabled on the TV.
 /// `gpu`: draw on the graphics plane (fast, 1080p max) instead of the video plane (4K, ~85 ms slower).
-fn start_tv_app(host: &str, gpu: bool) -> Result<()> {
+async fn start_tv_app(host: &str, gpu: bool) -> Result<()> {
     // Finder-launched apps get a minimal PATH, so look where Homebrew puts adb too.
     let adb = ["/opt/homebrew/bin/adb", "/usr/local/bin/adb"]
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
         .unwrap_or("adb");
     let serial = format!("{host}:5555");
-    let run = |args: &[&str]| std::process::Command::new(adb).args(args).output();
-    run(&["connect", &serial]).context("running adb (brew install --cask android-platform-tools)")?;
+    // adb can hang on an unreachable TV; never wait longer than 10 s per call.
+    let run = async |args: &[&str]| -> Result<std::process::Output> {
+        let out = tokio::process::Command::new(adb).args(args).kill_on_drop(true).output();
+        Ok(tokio::time::timeout(Duration::from_secs(10), out).await.context("adb timed out")??)
+    };
+    run(&["connect", &serial]).await.context("running adb (brew install --cask android-platform-tools)")?;
     // -S restarts the activity, so a changed plane choice takes effect.
     let texture = gpu.to_string();
     let activity = "de.tisth.castmirror/.MainActivity";
-    let out = run(&["-s", &serial, "shell", "am", "start", "-S", "-n", activity, "--ez", "texture", &texture])?;
+    let out = run(&["-s", &serial, "shell", "am", "start", "-S", "-n", activity, "--ez", "texture", &texture]).await?;
     let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     if !out.status.success() || text.contains("Error") {
         anyhow::bail!("TV app not started on {host}: {}", text.trim());
     }
     // Give the app a moment to open its socket.
-    std::thread::sleep(Duration::from_millis(1200));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
     Ok(())
 }
 

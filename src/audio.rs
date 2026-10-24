@@ -9,7 +9,7 @@ use crate::capture::{AUDIO_CHANNELS, AUDIO_RATE};
 
 pub const FRAME: Duration = Duration::from_millis(10);
 const FRAME_SAMPLES: usize = (AUDIO_RATE as usize / 100) * AUDIO_CHANNELS;
-// Jump the sample clock forward only after a real gap (audio paused); bursty delivery stays continuous.
+// Jump the sample clock forward after a pause this long; bursty delivery stays continuous.
 const MAX_GAP: Duration = Duration::from_millis(200);
 // Ramps instead of hard edges: starting or stopping mid-waveform crackles on the receiver.
 const FADE_IN: usize = AUDIO_RATE as usize / 20; // 50 ms, in sample frames
@@ -30,6 +30,8 @@ pub struct OpusFramer {
     since_anchor: usize,
     // Sample frames into the fade-out, once it started.
     fading: Option<usize>,
+    // Audio was dropped before the next chunk.
+    realign: bool,
     // CAST_MIRROR_AUDIO_DUMP=file: raw f32 stereo of exactly what gets encoded, to look for clicks.
     dump: Option<std::fs::File>,
 }
@@ -45,8 +47,15 @@ impl OpusFramer {
             pending_start: None,
             since_anchor: 0,
             fading: None,
+            realign: false,
             dump: std::env::var_os("CAST_MIRROR_AUDIO_DUMP").and_then(|p| std::fs::File::create(p).ok()),
         })
+    }
+
+    /// Audio was dropped: if the timeline now lags the capture clock, the next chunk realigns it
+    /// (with a fade-in). Otherwise it falls behind and the receiver skips everything as too late.
+    pub fn gap(&mut self) {
+        self.realign = true;
     }
 
     /// Ramps everything pushed from now on down to silence over 60 ms.
@@ -75,12 +84,11 @@ impl OpusFramer {
         let wall_start = captured_at.saturating_duration_since(self.origin).saturating_sub(chunk_len);
         let queued = Duration::from_secs_f64((self.pending.len() / AUDIO_CHANNELS) as f64 / AUDIO_RATE as f64);
         let expected_start = self.pending_start.map(|s| s + queued);
-        // Never backwards: ScreenCaptureKit delivers in bursts, and a receiver drops audio whose
-        // timestamps go back (that was the crackling).
-        if expected_start.is_none_or(|e| wall_start > e + MAX_GAP) {
-            if let Some(e) = expected_start {
-                tracing::warn!("audio gap of {:?}: timeline jumps forward", wall_start - e);
-            }
+        let paused = expected_start.is_some_and(|e| wall_start > e + MAX_GAP);
+        // After dropped audio, but only if the timeline really lags: each realign restarts the fade-in.
+        let lagging = std::mem::take(&mut self.realign) && expected_start.is_some_and(|e| wall_start > e + FRAME);
+        if expected_start.is_none() || paused || lagging {
+            // Every trigger moves forward: a receiver drops audio whose timestamps go back (crackling).
             self.pending.clear();
             self.pending_start = Some(wall_start);
             self.since_anchor = 0;
@@ -134,7 +142,7 @@ mod tests {
     fn fades_in_at_start_and_out_on_request() {
         let origin = Instant::now();
         let mut framer = OpusFramer::new(origin, 128_000).unwrap();
-        framer.push(&vec![1.0; 2], origin).unwrap();
+        framer.push(&[1.0; 2], origin).unwrap();
         assert_eq!(framer.pending[..2], [0.0, 0.0], "first sample of the fade-in is silent");
         let full = framer.apply_gain(&vec![1.0; FADE_IN * 2]);
         assert_eq!(full[FADE_IN * 2 - 1], 1.0, "fade-in done after 50 ms");
@@ -142,6 +150,21 @@ mod tests {
         let out = framer.apply_gain(&vec![1.0; (FADE_OUT + 10) * 2]);
         // Interleaved stereo: sample frame i sits at index 2 * i.
         assert!(out[0] == 1.0 && out[2 * (FADE_OUT - 1)] < 0.01 && out[2 * (FADE_OUT + 5)] == 0.0, "60 ms ramp, then silence");
+    }
+
+    #[test]
+    fn gap_realigns_forward_only() {
+        let origin = Instant::now();
+        let mut framer = OpusFramer::new(origin, 128_000).unwrap();
+        framer.push(&vec![0.0; 960], origin + Duration::from_millis(10)).unwrap();
+        // 120 ms went missing: below MAX_GAP, so only the reported gap realigns.
+        framer.gap();
+        let after = framer.push(&vec![0.0; 960], origin + Duration::from_millis(140)).unwrap();
+        assert_eq!(after[0].media_timestamp, Duration::from_millis(130));
+        // A gap while the capture clock reads behind the timeline must not move it back.
+        framer.gap();
+        let next = framer.push(&vec![0.0; 960], origin + Duration::from_millis(100)).unwrap();
+        assert_eq!(next[0].media_timestamp, Duration::from_millis(140));
     }
 
     #[test]
