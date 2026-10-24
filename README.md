@@ -24,6 +24,15 @@ Ctrl-C sends STOP and closes the channel. A lost receiver is reconnected once af
 Needs Screen Recording permission for the terminal (System Settings → Privacy & Security).
 `--features vp8` adds a software VP8 encoder (needs `brew install libvpx pkgconf`).
 
+## Menu bar app
+
+`scripts/bundle-app.sh` builds `~/Applications/CastMirror.app` (log: `~/Library/Logs/CastMirror.log`).
+The menu offers **Cast screen** (a submenu when several displays are connected), **Cast window…** (the macOS
+window picker), **Stop casting**, the receiver and a latency profile. While casting, picking another screen or
+window switches to it. **Mute Mac while casting** silences the Mac's output: ScreenCaptureKit records the apps'
+audio before the output volume, so the receiver still gets all of it. After an update, macOS asks for the Screen
+Recording permission again; grant it, then use **Restart app**.
+
 ## Layout
 
 - `src/capture.rs`: ScreenCaptureKit, NV12 frames (latest-only, never queued) and 48 kHz stereo audio

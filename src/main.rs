@@ -65,7 +65,7 @@ pub struct MirrorArgs {
     /// Display index as listed by ScreenCaptureKit.
     #[arg(long, default_value_t = 0)]
     pub display: usize,
-    /// Capture only the largest window whose app name or title contains this (any case), not the display.
+    /// Capture only this window (id, or text in "app: title"; the largest match wins) instead of the display.
     #[arg(long)]
     pub window: Option<String>,
     /// Print live fps, bitrate, RTT, retransmits and dropped frames.

@@ -17,6 +17,7 @@ unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
     fn CGMainDisplayID() -> u32;
+    fn CGDisplayIsBuiltin(display: u32) -> u32;
 }
 
 #[derive(Clone)]
@@ -194,26 +195,47 @@ impl Drop for Capture {
     }
 }
 
+/// Menu labels for the displays, in the order `Capture::start` numbers them.
+pub fn display_labels() -> Result<Vec<String>> {
+    let content = SCShareableContent::get().context("listing displays")?;
+    Ok(content
+        .displays()
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            let name = if unsafe { CGDisplayIsBuiltin(d.display_id()) } != 0 {
+                "Built-in display".to_string()
+            } else {
+                format!("Display {}", i + 1)
+            };
+            let main = if d.display_id() == unsafe { CGMainDisplayID() } { ", main" } else { "" };
+            format!("{name} ({}×{}{main})", d.width(), d.height())
+        })
+        .collect())
+}
+
 /// Fails before a receiver is launched when no window matches, listing the open ones.
 pub fn check_window(query: &str) -> Result<()> {
     find_window(&SCShareableContent::get().context("listing windows")?, query).map(drop)
 }
 
-fn window_label(w: &SCWindow) -> String {
+pub fn window_label(w: &SCWindow) -> String {
     let app = w.owning_application().map(|a| a.application_name()).unwrap_or_default();
     format!("{app}: {}", w.title().unwrap_or_default())
 }
 
-/// The largest on-screen app window whose "app: title" contains `query`, ignoring case.
+/// The window with id `query`, else the largest on-screen app window whose "app: title" contains `query`
+/// (any case). The tray passes ids: titles change, e.g. with every video a browser tab plays.
 fn find_window(content: &SCShareableContent, query: &str) -> Result<SCWindow> {
     let area = |w: &SCWindow| (w.frame().size.width * w.frame().size.height) as u64;
     // Layer 0 holds normal app windows; menus, the Dock and overlays sit above it.
     let windows: Vec<SCWindow> =
         content.windows().into_iter().filter(|w| w.is_on_screen() && w.window_layer() == 0 && area(w) > 0).collect();
     let needle = query.to_lowercase();
+    let id = query.parse::<u32>().ok();
     windows
         .iter()
-        .filter(|w| window_label(w).to_lowercase().contains(&needle))
+        .filter(|w| Some(w.window_id()) == id || window_label(w).to_lowercase().contains(&needle))
         .max_by_key(|w| area(w))
         .cloned()
         .with_context(|| {

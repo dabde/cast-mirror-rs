@@ -43,12 +43,77 @@ enum Ui {
     Devices(Vec<(String, String)>),
     Status(String),
     Stopped(Option<String>),
+    // Picked in the macOS window picker: id and "app: title".
+    Window(u32, String),
 }
 
 struct Device {
     item: CheckMenuItem,
     name: String,
     addr: String,
+}
+
+/// What gets cast: a display (index as `Capture::start` counts them) or a window.
+#[derive(Clone)]
+enum Target {
+    Display(usize, String),
+    Window(u32, String),
+}
+
+impl Target {
+    fn label(&self) -> String {
+        match self {
+            Self::Display(_, name) => format!("screen {name}"),
+            Self::Window(_, title) => format!("window {}", shorten(title)),
+        }
+    }
+}
+
+/// "Cast screen": one item for one display, a submenu to pick from when there are more.
+struct Screens {
+    single: MenuItem,
+    submenu: Submenu,
+    items: Vec<MenuItem>,
+    labels: Vec<String>,
+}
+
+impl Screens {
+    const POSITION: usize = 2;
+
+    fn refresh(&mut self, menu: &Menu) {
+        self.labels = crate::capture::display_labels()
+            .inspect_err(|e| tracing::warn!("{e:#}"))
+            .unwrap_or_default();
+        for item in self.items.drain(..) {
+            let _ = self.submenu.remove(&item);
+        }
+        let _ = menu.remove(&self.single);
+        let _ = menu.remove(&self.submenu);
+        if self.labels.len() > 1 {
+            for label in &self.labels {
+                let item = MenuItem::new(label, true, None);
+                let _ = self.submenu.append(&item);
+                self.items.push(item);
+            }
+            let _ = menu.insert(&self.submenu, Self::POSITION);
+        } else {
+            let _ = menu.insert(&self.single, Self::POSITION);
+        }
+    }
+
+    /// The display a menu event picked, if it was one of ours.
+    fn picked(&self, id: &tray_icon::menu::MenuId) -> Option<Target> {
+        let label = |i: usize| self.labels.get(i).cloned().unwrap_or_else(|| format!("{}", i + 1));
+        if id == self.single.id() {
+            return Some(Target::Display(0, label(0)));
+        }
+        self.items.iter().position(|item| id == item.id()).map(|i| Target::Display(i, label(i)))
+    }
+
+    fn set_enabled(&self, enabled: bool) {
+        self.single.set_enabled(enabled);
+        self.submenu.set_enabled(enabled);
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -62,7 +127,14 @@ pub fn run() -> Result<()> {
     }));
 
     let status = MenuItem::new("Looking for receivers…", false, None);
-    let start = MenuItem::new("Start casting", false, None);
+    let mut screens = Screens {
+        single: MenuItem::new("Cast screen", false, None),
+        submenu: Submenu::new("Cast screen", false),
+        items: Vec::new(),
+        labels: Vec::new(),
+    };
+    let cast_window = MenuItem::new("Cast window…", false, None);
+    let stop_item = MenuItem::new("Stop casting", false, None);
     let receivers = Submenu::new("Receiver", true);
     let profiles: Vec<CheckMenuItem> = PROFILES
         .iter()
@@ -70,18 +142,22 @@ pub fn run() -> Result<()> {
         .map(|(i, p)| CheckMenuItem::new(p.label, true, i == DEFAULT_PROFILE, None))
         .collect();
     let audio = CheckMenuItem::new("Audio", true, true, None);
+    // ScreenCaptureKit records the apps' audio before the output volume, so the TV still gets all of it.
+    let mute = CheckMenuItem::new("Mute Mac while casting", true, false, None);
     let direct = CheckMenuItem::new("Direct to TV app (lowest latency)", true, false, None);
-    let rescan = MenuItem::new("Rescan receivers", true, None);
+    let rescan = MenuItem::new("Rescan receivers and screens", true, None);
     // macOS applies a newly granted Screen Recording permission only to a fresh process.
     let relaunch = MenuItem::new("Restart app", true, None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
-    menu.append_items(&[&status, &PredefinedMenuItem::separator(), &start, &receivers])?;
+    menu.append_items(&[&status, &PredefinedMenuItem::separator(), &cast_window, &stop_item, &receivers])?;
     menu.append(&PredefinedMenuItem::separator())?;
     for p in &profiles {
         menu.append(p)?;
     }
-    menu.append_items(&[&audio, &direct, &PredefinedMenuItem::separator(), &rescan, &relaunch, &quit])?;
+    menu.append_items(&[&PredefinedMenuItem::separator(), &audio, &mute, &direct])?;
+    menu.append_items(&[&PredefinedMenuItem::separator(), &rescan, &relaunch, &quit])?;
+    screens.refresh(&menu);
 
     rt.spawn(scan(proxy.clone()));
 
@@ -89,19 +165,32 @@ pub fn run() -> Result<()> {
     let mut devices: Vec<Device> = Vec::new();
     let mut selected: Option<String> = None;
     let mut profile = DEFAULT_PROFILE;
+    let mut target: Option<Target> = None;
     let mut stop: Option<watch::Sender<bool>> = None;
     let (mut restart, mut quitting) = (false, false);
-    let mut menu = Some(menu);
+    // Set when we muted the Mac, so stopping restores exactly what the user had.
+    let mut muted_by_us = false;
+    let mut tray_menu = Some(menu.clone());
 
     event_loop.run(move |event, _, flow| {
         *flow = ControlFlow::Wait;
         let casting = stop.is_some();
         let mut begin = false;
+        // A new target starts casting, or restarts a running session with it.
+        let mut cast = |t: Target, begin: &mut bool, restart: &mut bool| {
+            tracing::info!("menu: cast {}", t.label());
+            target = Some(t);
+            if casting {
+                *restart = true;
+            } else {
+                *begin = true;
+            }
+        };
         match event {
             // tray-icon wants the event loop running before the icon exists.
             Event::NewEvents(StartCause::Init) => {
                 tray = TrayIconBuilder::new()
-                    .with_menu(Box::new(menu.take().unwrap()))
+                    .with_menu(Box::new(tray_menu.take().unwrap()))
                     .with_icon_templated(icon(false))
                     .with_tooltip("Cast Mirror")
                     .build()
@@ -124,18 +213,17 @@ pub fn run() -> Result<()> {
                 if !casting {
                     status.set_text(if devices.is_empty() { "No receivers found" } else { "Ready" });
                 }
-                start.set_enabled(casting || selected.is_some());
             }
             Event::UserEvent(Ui::Status(text)) => status.set_text(text),
+            Event::UserEvent(Ui::Window(id, title)) => cast(Target::Window(id, title), &mut begin, &mut restart),
             Event::UserEvent(Ui::Stopped(error)) => {
                 stop = None;
-                start.set_text("Start casting");
-                start.set_enabled(selected.is_some());
                 status.set_text(error.as_deref().unwrap_or("Stopped"));
                 if let Some(t) = &tray {
                     let _ = t.set_icon_templated(Some(icon(false)));
                 }
                 if quitting {
+                    set_output_muted(false, &mut muted_by_us);
                     *flow = ControlFlow::Exit;
                     return;
                 }
@@ -145,19 +233,17 @@ pub fn run() -> Result<()> {
                 }
             }
             Event::UserEvent(Ui::Menu(e)) => {
-                if e.id == *start.id() {
-                    match &stop {
-                        Some(tx) => {
-                            tracing::info!("menu: stop");
-                            let _ = tx.send(true);
-                            // An explicit stop wins over a restart queued by an earlier settings change.
-                            restart = false;
-                            status.set_text("Stopping…");
-                        }
-                        None => {
-                            tracing::info!("menu: start");
-                            begin = true;
-                        }
+                if let Some(t) = screens.picked(&e.id) {
+                    cast(t, &mut begin, &mut restart);
+                } else if e.id == *cast_window.id() {
+                    show_window_picker(proxy.clone());
+                } else if e.id == *stop_item.id() {
+                    if let Some(tx) = &stop {
+                        tracing::info!("menu: stop");
+                        let _ = tx.send(true);
+                        // An explicit stop wins over a restart queued by an earlier settings change.
+                        restart = false;
+                        status.set_text("Stopping…");
                     }
                 } else if e.id == *quit.id() || e.id == *relaunch.id() {
                     if e.id == *relaunch.id() {
@@ -177,6 +263,7 @@ pub fn run() -> Result<()> {
                     }
                 } else if e.id == *rescan.id() {
                     status.set_text("Looking for receivers…");
+                    screens.refresh(&menu);
                     rt.spawn(scan(proxy.clone()));
                 } else if let Some(i) = profiles.iter().position(|p| e.id == *p.id()) {
                     profile = i;
@@ -194,16 +281,17 @@ pub fn run() -> Result<()> {
                 for d in &devices {
                     d.item.set_checked(Some(&d.name) == selected.as_ref());
                 }
-                if restart && let Some(tx) = &stop {
-                    let _ = tx.send(true);
-                    status.set_text("Restarting…");
-                }
             }
             _ => {}
         }
+        if restart && let Some(tx) = &stop {
+            let _ = tx.send(true);
+            status.set_text("Restarting…");
+        }
 
         if begin && stop.is_none() {
-            let Some(addr) = devices.iter().find(|d| Some(&d.name) == selected.as_ref()).map(|d| d.addr.clone())
+            let (Some(addr), Some(what)) =
+                (devices.iter().find(|d| Some(&d.name) == selected.as_ref()).map(|d| d.addr.clone()), target.clone())
             else {
                 return;
             };
@@ -215,6 +303,10 @@ pub fn run() -> Result<()> {
             args.bitrate = PROFILES[profile].bitrate;
             args.auto = PROFILES[profile].auto;
             args.no_audio = !audio.is_checked();
+            match &what {
+                Target::Display(i, _) => args.display = *i,
+                Target::Window(id, _) => args.window = Some(id.to_string()),
+            }
             let direct = direct.is_checked();
             if direct {
                 // HEVC: the TV's MediaTek HEVC decoder buffers less than its H.264 one.
@@ -223,10 +315,11 @@ pub fn run() -> Result<()> {
             }
             let (tx, rx) = watch::channel(false);
             let status_proxy = proxy.clone();
+            let label = what.label();
             let control = Control {
                 stop: rx,
                 status: Arc::new(move |s| {
-                    let _ = status_proxy.send_event(Ui::Status(s));
+                    let _ = status_proxy.send_event(Ui::Status(format!("{s} · {label}")));
                 }),
             };
             let done = proxy.clone();
@@ -251,13 +344,65 @@ pub fn run() -> Result<()> {
                 let _ = done.send_event(Ui::Stopped(result.err().map(|e| format!("Error: {e:#}"))));
             });
             stop = Some(tx);
-            start.set_text("Stop casting");
-            status.set_text(format!("Starting ({})…", PROFILES[profile].label));
+            status.set_text(format!("Starting {} ({})…", what.label(), PROFILES[profile].label));
             if let Some(t) = &tray {
                 let _ = t.set_icon_templated(Some(icon(true)));
             }
         }
+        // Mute only while audio actually goes to the receiver; direct mode sends none.
+        let want_mute = stop.is_some() && mute.is_checked() && audio.is_checked() && !direct.is_checked();
+        set_output_muted(want_mute, &mut muted_by_us);
+        let ready = selected.is_some();
+        screens.set_enabled(ready);
+        cast_window.set_enabled(ready);
+        stop_item.set_enabled(stop.is_some());
     })
+}
+
+/// Mutes the Mac's output, or restores it if we muted it; leaves a mute the user set alone.
+fn set_output_muted(want: bool, muted_by_us: &mut bool) {
+    let osascript = |script: &str| {
+        std::process::Command::new("osascript").args(["-e", script]).output().ok().filter(|o| o.status.success())
+    };
+    if want && !*muted_by_us {
+        let user_muted = osascript("output muted of (get volume settings)")
+            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
+        if !user_muted && osascript("set volume output muted true").is_some() {
+            *muted_by_us = true;
+        }
+    } else if !want && *muted_by_us {
+        osascript("set volume output muted false");
+        *muted_by_us = false;
+    }
+}
+
+/// Opens the macOS window picker; the choice comes back as `Ui::Window`.
+fn show_window_picker(proxy: EventLoopProxy<Ui>) {
+    use screencapturekit::content_sharing_picker::*;
+    let mut config = SCContentSharingPickerConfiguration::new();
+    config.set_allowed_picker_modes(&[SCContentSharingPickerMode::SingleWindow]);
+    SCContentSharingPicker::show(&config, move |outcome| {
+        match outcome {
+            SCPickerOutcome::Picked(result) => {
+                if let Some(w) = result.windows().first() {
+                    let _ = proxy.send_event(Ui::Window(w.window_id(), crate::capture::window_label(w)));
+                }
+            }
+            SCPickerOutcome::Cancelled => {}
+            SCPickerOutcome::Error(e) => {
+                let _ = proxy.send_event(Ui::Status(format!("Window picker: {e}")));
+            }
+        }
+        // Leaving it active keeps a "ready to share" entry in Control Center.
+        SCContentSharingPicker::set_active(false);
+    });
+}
+
+fn shorten(text: &str) -> String {
+    match text.char_indices().nth(40) {
+        Some((i, _)) => format!("{}…", &text[..i]),
+        None => text.to_string(),
+    }
 }
 
 /// Starts this app again once the current process has exited (a second instance would add a second icon).
