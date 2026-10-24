@@ -10,12 +10,15 @@ cargo build --release
 ./target/release/cast-mirror launch dactv         # start the mirroring app (0F5096E8) and exit
 ./target/release/cast-mirror pattern dactv        # solid colour changing every second
 ./target/release/cast-mirror dactv --stats        # mirror display 0 with audio
+./target/release/cast-mirror dactv --window brave # only that window (and only its app's audio)
 ```
 
-Options: `--fps 30 --bitrate 6M --width 1920 --delay 100 --no-audio --display N --stats`,
+Options: `--fps 30 --bitrate 6M --width 1920 --delay 100 --no-audio --display N --window TEXT --stats`,
 `--codecs h264,hevc,vp8` (offer order = preference, the receiver picks),
 `--spec-payload-types` (H.264 101 / Opus 96 instead of Chrome's 96 / 127).
 DEVICE is a name substring, Cast id, IP, or `ip:port`; default is the first receiver found.
+`--window` picks the largest visible window whose "app: title" contains TEXT (any case); without a match it
+lists the open windows. The capture size is fixed at the start, so resize the window before casting.
 Ctrl-C sends STOP and closes the channel. A lost receiver is reconnected once after 2 s; a second loss within 30 s stops with a hint. If another sender takes the receiver over (or it is stopped on the TV), mirroring stops instead of grabbing it back.
 
 Needs Screen Recording permission for the terminal (System Settings → Privacy & Security).

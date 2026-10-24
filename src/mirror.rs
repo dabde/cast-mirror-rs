@@ -72,6 +72,9 @@ impl Control {
 pub async fn run(args: MirrorArgs, source: Source, control: Control) -> Result<()> {
     if source == Source::Screen {
         capture::ensure_permission()?;
+        if let Some(query) = &args.window {
+            capture::check_window(query)?;
+        }
     }
     let addr = resolve(args.device.as_deref()).await?;
     #[cfg(feature = "test-receiver")]
@@ -157,7 +160,9 @@ async fn session(
 
     let mut fps = args.fps;
     let mut capture = match source {
-        Source::Screen => Some(Capture::start(args.display, args.width, fps, latest.clone(), audio_tx.clone())?),
+        Source::Screen => {
+            Some(Capture::start(args.display, args.window.as_deref(), args.width, fps, latest.clone(), audio_tx.clone())?)
+        }
         Source::Pattern => None,
     };
     let (mut width, mut height) =
@@ -215,7 +220,7 @@ async fn session(
                 info!("receiver caps video at {}x{}; capturing {width}x{height}", dims.width, dims.height);
                 if source == Source::Screen {
                     drop(capture.take());
-                    let c = Capture::start(args.display, width, fps, latest.clone(), audio_tx.clone())?;
+                    let c = Capture::start(args.display, args.window.as_deref(), width, fps, latest.clone(), audio_tx.clone())?;
                     // Capture fits its own 16:9 box; encode exactly what it delivers.
                     (width, height) = (c.width, c.height);
                     capture = Some(c);

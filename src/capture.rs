@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, Notify};
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
+    fn CGMainDisplayID() -> u32;
 }
 
 #[derive(Clone)]
@@ -104,9 +105,10 @@ pub fn ensure_permission() -> Result<()> {
 }
 
 impl Capture {
-    /// Captures `display` scaled to `width` (height follows the display aspect, both even).
+    /// Captures `window` (see [`find_window`]) or else `display`, scaled into a `width` x 16:9 box.
     pub fn start(
         display: usize,
+        window: Option<&str>,
         width: u32,
         fps: u32,
         latest: Arc<LatestFrame>,
@@ -114,13 +116,27 @@ impl Capture {
     ) -> Result<Self> {
         ensure_permission()?;
         let content = SCShareableContent::get().context("listing displays")?;
-        let displays = content.displays();
-        let target = displays
-            .get(display)
-            .with_context(|| format!("display {display} not found ({} available)", displays.len()))?;
-        let (width, height) = fit_16_9(width.min(target.width() * 2), target.width(), target.height());
-
-        let filter = SCContentFilter::create().with_display(target).with_excluding_windows(&[]).build();
+        let (filter, (source_w, source_h)) = match window {
+            Some(query) => {
+                let window = find_window(&content, query)?;
+                // A window filter needs a WindowServer connection, which a CLI process lacks until
+                // CoreGraphics is first used (else: "Assertion failed: did_initialize").
+                unsafe { CGMainDisplayID() };
+                let size = window.frame().size;
+                tracing::info!("capturing window {}", window_label(&window));
+                (SCContentFilter::create().with_window(&window).build(), (size.width as u32, size.height as u32))
+            }
+            None => {
+                let displays = content.displays();
+                let target = displays
+                    .get(display)
+                    .with_context(|| format!("display {display} not found ({} available)", displays.len()))?;
+                let filter = SCContentFilter::create().with_display(target).with_excluding_windows(&[]).build();
+                (filter, (target.width(), target.height()))
+            }
+        };
+        // Sizes are in points; capturing up to 2x keeps Retina detail.
+        let (width, height) = fit_16_9(width.min(source_w * 2), source_w, source_h);
         let mut config = SCStreamConfiguration::default();
         config
             .set_width(width)
@@ -178,6 +194,34 @@ impl Drop for Capture {
     }
 }
 
+/// Fails before a receiver is launched when no window matches, listing the open ones.
+pub fn check_window(query: &str) -> Result<()> {
+    find_window(&SCShareableContent::get().context("listing windows")?, query).map(drop)
+}
+
+fn window_label(w: &SCWindow) -> String {
+    let app = w.owning_application().map(|a| a.application_name()).unwrap_or_default();
+    format!("{app}: {}", w.title().unwrap_or_default())
+}
+
+/// The largest on-screen app window whose "app: title" contains `query`, ignoring case.
+fn find_window(content: &SCShareableContent, query: &str) -> Result<SCWindow> {
+    let area = |w: &SCWindow| (w.frame().size.width * w.frame().size.height) as u64;
+    // Layer 0 holds normal app windows; menus, the Dock and overlays sit above it.
+    let windows: Vec<SCWindow> =
+        content.windows().into_iter().filter(|w| w.is_on_screen() && w.window_layer() == 0 && area(w) > 0).collect();
+    let needle = query.to_lowercase();
+    windows
+        .iter()
+        .filter(|w| window_label(w).to_lowercase().contains(&needle))
+        .max_by_key(|w| area(w))
+        .cloned()
+        .with_context(|| {
+            let open: Vec<String> = windows.iter().map(window_label).collect();
+            format!("no window matches {query:?}; open windows:\n  {}", open.join("\n  "))
+        })
+}
+
 /// Scales the display into a `max_width` x 16:9 box with even sides. Receivers that send no
 /// constraints (Chromecast) still show a black screen above 1080 lines, e.g. 1920x1240 from a 16:10 Mac.
 fn fit_16_9(max_width: u32, display_w: u32, display_h: u32) -> (u32, u32) {
@@ -220,7 +264,7 @@ mod tests {
     async fn captures_encodes_and_delivers_audio() {
         let latest = Arc::new(LatestFrame::default());
         let (tx, mut rx) = mpsc::channel(64);
-        let cap = Capture::start(0, 1280, 30, latest.clone(), Some(tx)).unwrap();
+        let cap = Capture::start(0, None, 1280, 30, latest.clone(), Some(tx)).unwrap();
         let enc = Encoder::new(crate::video::VtCodec::H264, cap.width, cap.height, 30, 4_000_000).unwrap();
         tokio::time::timeout(Duration::from_secs(3), latest.ready.notified()).await.expect("no video frame");
         let frame = latest.take().unwrap();
@@ -241,7 +285,7 @@ mod leak_probe {
     #[ignore = "needs Screen Recording permission and a changing screen"]
     async fn frames_keep_coming_when_released() {
         let latest = Arc::new(LatestFrame::default());
-        let _cap = Capture::start(0, 1280, 30, latest.clone(), None).unwrap();
+        let _cap = Capture::start(0, None, 1280, 30, latest.clone(), None).unwrap();
         let mut n = 0;
         let end = Instant::now() + Duration::from_secs(3);
         while Instant::now() < end {
