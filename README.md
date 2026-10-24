@@ -33,6 +33,22 @@ window switches to it. **Rescan** sits in the Receiver submenu and refreshes the
 audio before the output volume, so the receiver still gets all of it. After an update, macOS asks for the Screen
 Recording permission again; grant it, then use **Restart app**.
 
+### Signing
+
+Ad-hoc signed builds lose the Screen Recording permission on every rebuild. `bundle-app.sh` signs with a
+code-signing identity named "CastMirror Local Signing" when the keychain has one; a self-signed one is enough
+(it need not be trusted):
+
+```sh
+printf '[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=CastMirror Local Signing\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' > /tmp/cs.cnf
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config /tmp/cs.cnf -keyout /tmp/cs.key -out /tmp/cs.pem
+openssl pkcs12 -export -inkey /tmp/cs.key -in /tmp/cs.pem -name "CastMirror Local Signing" -out /tmp/cs.p12 -passout pass:x
+security import /tmp/cs.p12 -k ~/Library/Keychains/login.keychain-db -P x -T /usr/bin/codesign
+rm /tmp/cs.cnf /tmp/cs.key /tmp/cs.pem /tmp/cs.p12
+```
+
+Grant the permission once more after the first signed build; later builds keep it.
+
 ## Layout
 
 - `src/capture.rs`: ScreenCaptureKit, NV12 frames (latest-only, never queued) and 48 kHz stereo audio

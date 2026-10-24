@@ -22,6 +22,12 @@ cat > $app/Contents/Info.plist <<'PLIST'
   <key>NSLocalNetworkUsageDescription</key><string>Finds and streams to Cast receivers on your network.</string>
 </dict></plist>
 PLIST
-# Ad-hoc signature: macOS ties the Screen Recording permission to it.
-codesign --force --deep -s - $app
+# macOS ties the Screen Recording permission to the signature. An ad-hoc one changes with every build,
+# so the permission is lost each time; a fixed certificate keeps it (see README, "Signing").
+identity="CastMirror Local Signing"
+if security find-identity -p codesigning | grep -q "\"$identity\""; then
+  codesign --force --deep -s "$identity" $app
+else
+  codesign --force --deep -s - $app
+fi
 echo "Built $app (add it to System Settings → General → Login Items to start at login)"
