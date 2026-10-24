@@ -1,0 +1,35 @@
+[package]
+name = "cast-mirror"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.1"
+chromiacast = { version = "0.3.1", features = ["discovery"] }
+clap = { version = "4.6.7", features = ["derive"] }
+env-libvpx-sys = { version = "5.1.3", optional = true, features = ["generate"] }
+objc2-core-foundation = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-core-video = "0.3.2"
+objc2-video-toolbox = "0.3.2"
+opus = "0.4.0"
+screencapturekit = "8"
+tao = "0.37.2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tray-icon = "0.26.1"
+
+[features]
+# Software VP8 fallback; needs libvpx (brew install libvpx).
+vp8 = ["dep:env-libvpx-sys"]
+# Hidden --unverified flag to test against openscreen's dev cast_receiver; never for real devices.
+test-receiver = ["chromiacast/dangerous-unverified"]
+
+# Chrome payload-type option and openscreen test vectors; see vendor/chromiacast/PATCHES.md.
+[patch.crates-io]
+chromiacast = { path = "vendor/chromiacast" }
+
+[workspace]
+members = [".", "vendor/chromiacast"]

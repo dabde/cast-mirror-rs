@@ -1,0 +1,129 @@
+# cast-mirror
+
+Mirror the macOS desktop to a Cast receiver over **Cast Streaming** (the protocol Chrome's
+"Cast screen" uses): ScreenCaptureKit capture, VideoToolbox hardware H.264/HEVC, Opus audio,
+encrypted Cast RTP with NACK/retransmission. No Chrome, no Default Media Receiver buffering.
+
+```sh
+cargo build --release
+./target/release/cast-mirror scan                 # list receivers (name, model, id, address)
+./target/release/cast-mirror launch dactv         # start the mirroring app (0F5096E8) and exit
+./target/release/cast-mirror pattern dactv        # solid colour changing every second
+./target/release/cast-mirror dactv --stats        # mirror display 0 with audio
+```
+
+Options: `--fps 30 --bitrate 6M --width 1920 --delay 100 --no-audio --display N --stats`,
+`--codecs h264,hevc,vp8` (offer order = preference, the receiver picks),
+`--spec-payload-types` (H.264 101 / Opus 96 instead of Chrome's 96 / 127).
+DEVICE is a name substring, Cast id, IP, or `ip:port`; default is the first receiver found.
+Ctrl-C sends STOP and closes the channel. A lost receiver is reconnected once after 2 s; a second loss within 30 s stops with a hint. If another sender takes the receiver over (or it is stopped on the TV), mirroring stops instead of grabbing it back.
+
+Needs Screen Recording permission for the terminal (System Settings → Privacy & Security).
+`--features vp8` adds a software VP8 encoder (needs `brew install libvpx pkgconf`).
+
+## Layout
+
+- `src/capture.rs`: ScreenCaptureKit, NV12 frames (latest-only, never queued) and 48 kHz stereo audio
+- `src/video.rs`: VideoToolbox H.264/HEVC → Annex B with parameter sets on key frames
+- `src/vp8.rs`: libvpx VP8 fallback (feature `vp8`)
+- `src/audio.rs`: 10 ms Opus packets on the shared A/V timeline
+- `src/mirror.rs`: session loop, backpressure frame dropping, AIMD bitrate control, `--stats`
+- `vendor/chromiacast`: Cast control channel, device auth, OFFER/ANSWER, frame crypto, RTP/RTCP,
+  retransmission ([chromiacast](https://crates.io/crates/chromiacast) with local patches, see
+  `vendor/chromiacast/PATCHES.md`)
+
+## Tests
+
+```sh
+cargo test --workspace                       # unit tests, openscreen RTCP vectors, crypto KAT
+cargo test -- --include-ignored              # plus hardware encode and real screen capture
+```
+
+### Against openscreen's reference receiver (no TV needed)
+
+openscreen's `cast_receiver` decodes and displays the stream in a window. It uses a self-signed
+certificate, so Cast device auth is skipped with a test-only feature:
+
+```sh
+# in an openscreen checkout (fetch openscreen; gclient sync), see cast/docs/external_libraries.md
+gn gen out/av --args='is_debug=false have_ffmpeg=true have_libsdl2=true have_libopus=true ...'
+autoninja -C out/av cast_receiver
+./out/av/cast_receiver -g en0                          # once: writes generated_root_cast_receiver.{key,crt}
+./out/av/cast_receiver -p generated_root_cast_receiver.key -d generated_root_cast_receiver.crt en0
+
+cargo run --release --features test-receiver -- 192.168.x.y:8010 --unverified --stats
+```
+
+## Latency tuning (measured 2026-10-24, Philips TPM191E, Wi-Fi)
+
+Lag wheel on the Mac next to Photo Booth showing the TV, 6 screenshots per setting (`scripts/lag-sweep.sh`).
+Photo Booth's own ~145 ms is subtracted (calibrated with a phone photo); medians, roughly ±40 ms.
+
+**Chromecast dongle on HDMI 4, TV in Game mode** (honours the playout delay almost 1:1 down to ~60 ms;
+the default 100 keeps room for a Wi-Fi retransmit, `--delay 60` is the fastest useful setting):
+
+| Setting | End-to-end |
+|---|---|
+| `--delay 200` | ~210 ms |
+| `--delay 100` (default) | ~95 ms |
+| `--delay 60` | the floor: 40, 30, 20 and 10 measure the same (~190 ms with Photo Booth, i.e. roughly 50-100 ms real) |
+| `--delay 60` at 1670x1080, 834x540, 556x360 | all the same (204-213 ms with Photo Booth): resolution doesn't matter |
+| `--delay 60`, `--bitrate` 2 to 25M | latency the same at every level; above ~8 Mbit/s the encoder doesn't use more at 1080p30 |
+
+**TV's built-in Cast app** (keeps its own ~150 ms buffer, Game mode only exists on HDMI):
+
+| Setting | End-to-end |
+|---|---|
+| `--delay 200` | ~310-330 ms |
+| `--delay 150` | ~200 ms at any size: 1670x1080, 1112x720, 834x540, 556x360 all measure the same |
+| `--delay 100`, `--fps 60`, H.264 Main, motion smoothing off | no consistent gain |
+
+4K (`--width 3840`, 3340x2160 from a MacBook) shows on the TV's built-in app; the dongle accepted and ACKed it, picture unconfirmed.
+Neither receiver accepts HEVC for mirroring (both pick H.264 when offered `hevc,h264`).
+Frames above 1080 lines (1920x1240 before the 16:9 fit) cost ~90 ms on the TV app and show black on the dongle.
+
+Chrome to the built-in app: ~300 ms (offers targetDelay 200, H.264 Baseline). CPU 2-10 % of one core.
+Capture is fitted into a 16:9 box (1920 → 1670x1080 on a MacBook): the dongle shows a black screen above
+1080 lines even though its ANSWER sends no constraints.
+
+## Direct mode: own Android TV app (prototype, video only)
+
+The TV's Cast app holds frames for at least ~150 ms. `android/` is a minimal receiver app (plain Java, no
+Gradle) that feeds UDP frames straight into the hardware decoder and renders each one at once.
+
+```sh
+android/build.sh install 192.168.177.56        # build, install over adb, start
+cast-mirror 192.168.177.56 --direct --codecs hevc --fps 60
+```
+
+Measured on the Philips (same Photo Booth setup, medians, ~145 ms Photo Booth subtracted):
+
+| Path | End-to-end |
+|---|---|
+| Built-in Cast, `--delay 150` | ~240 ms |
+| Direct, H.264, video plane | ~165 ms |
+| Direct, HEVC, video plane | ~130-155 ms (the MediaTek HEVC decoder buffers less; Cast never accepted HEVC) |
+| **Direct, HEVC, 60 fps, GPU plane (default)** | **~70 ms**, on par with the Chromecast dongle in Game mode |
+
+The decoder's output goes through a TextureView, so the GPU composites it on the graphics plane like a game.
+The TV's video plane runs its picture processing (~85 ms); `--ez texture false` brings that path back.
+Declaring the app a game (`GAME=1 ./build.sh`) makes no difference on this Philips. The decoder rejects
+Android's KEY_LOW_LATENCY but accepts MediaTek's `vdec-lowlatency`.
+
+**Loss and congestion (protocol v2):** the app NACKs missing packets (and whole missing frames) and the sender
+resends them from a 120-frame history; a frame is only given up after 60 ms without progress while a later one is
+complete, then a key frame is requested (at most one per 500 ms). Every 100 ms the app reports received/expected
+packets and the minimum one-way delay. The sender cuts the bitrate when the queue grows (> 30 ms, down to 85 % of
+what got through) or loss over 1 s exceeds 10 %, holds at moderate loss (NACK repairs it), and climbs back 2 % per
+report after a calm second. `--auto` (tray profile "Auto") also steps the picture: 1080p60 ≥ 3.5 Mbit/s,
+1080p30 ≥ 2, 720p30 ≥ 1.2, else 540p30; down at once, up after 5 s with 20 % headroom.
+
+Tested without touching the network: `CAST_MIRROR_DROP=0.05` (5 % loss: stays at 1080p60, ~30 NACK repairs/s)
+and `CAST_MIRROR_CAP_KBPS=3000` (queue stays under ~40 ms, settles on 720p30 at ~1.9 Mbit/s).
+
+The TV's graphics plane is 1920x1080 (`wm size` override on a 3840x2160 panel), so the fast GPU path is
+1080p at most. The tray restarts the app on the 4K video plane for profiles wider than 1920 (Presentation):
+sharp, but ~85 ms slower. By hand: `adb shell am start -S -n de.tisth.castmirror/.MainActivity --ez texture false`.
+
+Tray: tick "Direct to TV app" to start the app over ADB and stream HEVC. Not yet: audio. The Chromecast dongle
+runs classic Cast firmware and can't install apps.
