@@ -72,6 +72,8 @@ pub fn run() -> Result<()> {
     let audio = CheckMenuItem::new("Audio", true, true, None);
     let direct = CheckMenuItem::new("Direct to TV app (lowest latency)", true, false, None);
     let rescan = MenuItem::new("Rescan receivers", true, None);
+    // macOS applies a newly granted Screen Recording permission only to a fresh process.
+    let relaunch = MenuItem::new("Restart app", true, None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
     menu.append_items(&[&status, &PredefinedMenuItem::separator(), &start, &receivers])?;
@@ -79,7 +81,7 @@ pub fn run() -> Result<()> {
     for p in &profiles {
         menu.append(p)?;
     }
-    menu.append_items(&[&audio, &direct, &PredefinedMenuItem::separator(), &rescan, &quit])?;
+    menu.append_items(&[&audio, &direct, &PredefinedMenuItem::separator(), &rescan, &relaunch, &quit])?;
 
     rt.spawn(scan(proxy.clone()));
 
@@ -157,7 +159,14 @@ pub fn run() -> Result<()> {
                             begin = true;
                         }
                     }
-                } else if e.id == *quit.id() {
+                } else if e.id == *quit.id() || e.id == *relaunch.id() {
+                    if e.id == *relaunch.id() {
+                        tracing::info!("menu: restart app");
+                        if let Err(err) = relaunch_after_exit() {
+                            status.set_text(format!("Restart failed: {err:#}"));
+                            return;
+                        }
+                    }
                     match &stop {
                         Some(tx) => {
                             // Let the session send STOP to the receiver before exiting.
@@ -249,6 +258,18 @@ pub fn run() -> Result<()> {
             }
         }
     })
+}
+
+/// Starts this app again once the current process has exited (a second instance would add a second icon).
+fn relaunch_after_exit() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let target = match exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")) {
+        Some(bundle) => format!("open {:?}", bundle),
+        None => format!("{:?} tray", exe),
+    };
+    let script = format!("while kill -0 {} 2>/dev/null; do sleep 0.2; done; {target}", std::process::id());
+    std::process::Command::new("/bin/sh").args(["-c", &script]).spawn()?;
+    Ok(())
 }
 
 /// (Re)starts the receiver app (android/) over ADB; network debugging must be enabled on the TV.
