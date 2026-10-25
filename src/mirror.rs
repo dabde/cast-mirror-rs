@@ -163,7 +163,8 @@ async fn session(
     let mut fps = args.fps;
     let mut capture = match source {
         Source::Screen => {
-            Some(Capture::start(args.display, args.window.as_deref(), args.width, fps, latest.clone(), audio_tx.clone())?)
+            let bounds = capture::box_16_9(args.width);
+            Some(Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), audio_tx.clone())?)
         }
         Source::Pattern => None,
     };
@@ -222,7 +223,8 @@ async fn session(
                 info!("receiver caps video at {}x{}; capturing {width}x{height}", dims.width, dims.height);
                 if source == Source::Screen {
                     drop(capture.take());
-                    let c = Capture::start(args.display, args.window.as_deref(), width, fps, latest.clone(), audio_tx.clone())?;
+                    let bounds = capture::box_16_9(width);
+                    let c = Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), audio_tx.clone())?;
                     // Capture fits its own 16:9 box; encode exactly what it delivers.
                     (width, height) = (c.width, c.height);
                     capture = Some(c);

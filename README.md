@@ -54,8 +54,9 @@ Grant the permission once more after the first signed build; later builds keep i
 
 ## Browser receiver
 
-`cast-mirror web --fps 60 --bitrate 10M` serves a receiver page any browser with WebCodecs can open (an iPad, a
-laptop): it prints a link `https://<this Mac>:7443/#<token>`. The certificate is self-signed (the browser asks
+`cast-mirror web --fps 60 --bitrate 20M` serves a receiver page any browser with WebCodecs can open (an iPad, a
+laptop): it prints a link `https://<this Mac>:7443/#<token>`. The page reports its screen in pixels and the Mac
+captures to fit exactly that (2314x1494 for an iPad Pro 11" in Safari), so the picture isn't scaled twice. The certificate is self-signed (the browser asks
 once); the token in the link is the access check.
 
 Video goes over a WebRTC data channel (UDP, via str0m on the Mac as ICE-lite peer), opened unordered with at most
@@ -67,7 +68,8 @@ Measured on an iPad Pro 11" (2018) over Wi-Fi: 50-80 ms glass to glass, 57 fps o
 4-18 ms. The first version used the WebSocket (TCP) for video: round trips up to 216 ms, and every burst piled up
 in Safari's decoder, which releases a frame only when the next one comes in. Two things mattered on the way:
 str0m's default 128 KB send buffer rejected every larger frame (key frames reach 230 KB), and at 6 Mbit/s busy
-pictures look blocky, so 10 Mbit/s is the sensible rate here.
+pictures look blocky. At native resolution 20 Mbit/s works (57 fps, round trip 11-18 ms at full rate; the
+network carried 30 Mbit/s too); key frames then reach 400 KB and still cause about four short hitches a minute.
 
 ## Layout
 

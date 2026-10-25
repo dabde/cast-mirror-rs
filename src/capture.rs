@@ -123,11 +123,11 @@ pub fn ensure_permission() -> Result<()> {
 }
 
 impl Capture {
-    /// Captures `window` (see [`find_window`]) or else `display`, scaled into a `width` x 16:9 box.
+    /// Captures `window` (see [`find_window`]) or else `display`, scaled to fit `bounds` (width, height).
     pub fn start(
         display: usize,
         window: Option<&str>,
-        width: u32,
+        bounds: (u32, u32),
         fps: u32,
         latest: Arc<LatestFrame>,
         audio: Option<mpsc::Sender<AudioChunk>>,
@@ -154,7 +154,7 @@ impl Capture {
             }
         };
         // Sizes are in points; capturing up to 2x keeps Retina detail.
-        let (width, height) = fit_16_9(width.min(source_w * 2), source_w, source_h);
+        let (width, height) = fit(bounds.0.min(source_w * 2), bounds.1.min(source_h * 2), source_w, source_h);
         let mut config = SCStreamConfiguration::default();
         config
             .set_width(width)
@@ -261,10 +261,14 @@ fn find_window(content: &SCShareableContent, query: &str) -> Result<SCWindow> {
         })
 }
 
-/// Scales the display into a `max_width` x 16:9 box with even sides. Receivers that send no
-/// constraints (Chromecast) still show a black screen above 1080 lines, e.g. 1920x1240 from a 16:10 Mac.
-fn fit_16_9(max_width: u32, display_w: u32, display_h: u32) -> (u32, u32) {
-    let max_height = max_width * 9 / 16;
+/// A `width` x 16:9 box. Receivers that send no constraints (Chromecast) still show a black screen above
+/// 1080 lines, e.g. 1920x1240 from a 16:10 Mac.
+pub fn box_16_9(width: u32) -> (u32, u32) {
+    (width, width * 9 / 16)
+}
+
+/// Scales the display into a `max_width` x `max_height` box, keeping its aspect, with even sides.
+fn fit(max_width: u32, max_height: u32, display_w: u32, display_h: u32) -> (u32, u32) {
     let scale = (max_width as f64 / display_w as f64).min(max_height as f64 / display_h as f64);
     ((display_w as f64 * scale) as u32 & !1, (display_h as f64 * scale) as u32 & !1)
 }
@@ -291,9 +295,14 @@ mod tests {
 
     #[test]
     fn fits_into_16_9_box() {
+        let fit_16_9 = |w, dw, dh| {
+            let (bw, bh) = box_16_9(w);
+            fit(bw, bh, dw, dh)
+        };
         assert_eq!(fit_16_9(1920, 1512, 982), (1662, 1080), "16:10-ish MacBook");
         assert_eq!(fit_16_9(1920, 1920, 1080), (1920, 1080));
         assert_eq!(fit_16_9(1280, 3440, 1440), (1280, 534), "ultrawide is width-bound");
+        assert_eq!(fit(2388, 1668, 3456, 2234), (2388, 1542), "iPad Pro 11\" box, MacBook Pro screen");
     }
     use crate::video::Encoder;
     use std::time::Duration;
@@ -303,7 +312,7 @@ mod tests {
     async fn captures_encodes_and_delivers_audio() {
         let latest = Arc::new(LatestFrame::default());
         let (tx, mut rx) = mpsc::channel(64);
-        let cap = Capture::start(0, None, 1280, 30, latest.clone(), Some(tx)).unwrap();
+        let cap = Capture::start(0, None, box_16_9(1280), 30, latest.clone(), Some(tx)).unwrap();
         let enc = Encoder::new(crate::video::VtCodec::H264, cap.width, cap.height, 30, 4_000_000).unwrap();
         tokio::time::timeout(Duration::from_secs(3), latest.ready.notified()).await.expect("no video frame");
         let frame = latest.take().unwrap();
@@ -324,7 +333,7 @@ mod leak_probe {
     #[ignore = "needs Screen Recording permission and a changing screen"]
     async fn frames_keep_coming_when_released() {
         let latest = Arc::new(LatestFrame::default());
-        let _cap = Capture::start(0, None, 1280, 30, latest.clone(), None).unwrap();
+        let _cap = Capture::start(0, None, box_16_9(1280), 30, latest.clone(), None).unwrap();
         let mut n = 0;
         let end = Instant::now() + Duration::from_secs(3);
         while Instant::now() < end {

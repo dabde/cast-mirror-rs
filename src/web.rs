@@ -31,8 +31,8 @@ pub const PORT: u16 = 7443;
 const PAGE: &str = include_str!("web.html");
 const MIN_BITRATE: u32 = 1_000_000;
 // More than this waiting in the data channel means the link is behind: skip rather than queue. Room for a
-// key frame (up to ~250 KB at 12 Mbit/s) plus a few more, or each key frame would cause the next skip.
-const CHANNEL_BACKLOG: usize = 512 * 1024;
+// key frame (over 300 KB at 30 Mbit/s) plus a few more, or each key frame would cause the next skip.
+const CHANNEL_BACKLOG: usize = 1024 * 1024;
 // Forced key frames at most this often: each one is large, and a skip right after it would ask again.
 const KEY_INTERVAL: Duration = Duration::from_millis(500);
 // Pings carry µs since this instant; echoes turn into round-trip times.
@@ -58,6 +58,8 @@ enum Request {
 /// A browser that sent the right token.
 struct Viewer {
     peer: SocketAddr,
+    // Its screen in pixels, landscape: the picture is captured to fit it, so nothing is scaled twice.
+    screen: Option<(u32, u32)>,
     writer: tokio::io::WriteHalf<Socket>,
     requests: mpsc::Receiver<Request>,
     requests_tx: mpsc::Sender<Request>,
@@ -161,6 +163,8 @@ async fn serve(
     if opcode != 1 || hello["token"].as_str() != Some(token) {
         bail!("wrong token");
     }
+    let pixels = |key: &str| hello[key].as_u64().map(|v| v as u32).filter(|v| (320..=7680).contains(v));
+    let screen = pixels("width").zip(pixels("height"));
     let (requests_tx, requests) = mpsc::channel(32);
     let tx = requests_tx.clone();
     tokio::spawn(async move {
@@ -176,7 +180,7 @@ async fn serve(
         }
         let _ = tx.send(Request::Gone).await;
     });
-    viewers.send(Viewer { peer, writer, requests, requests_tx }).await?;
+    viewers.send(Viewer { peer, screen, writer, requests, requests_tx }).await?;
     Ok(())
 }
 
@@ -212,7 +216,8 @@ async fn webrtc(offer: &str, lan: IpAddr, requests: mpsc::Sender<Request>) -> Re
         .build(Instant::now());
     rtc.add_local_candidate(Candidate::host(local, "udp")?);
     let answer = rtc.sdp_api().accept_offer(SdpOffer::from_sdp_string(offer)?)?;
-    let (frames_tx, mut frames) = mpsc::channel::<Vec<u8>>(2);
+    // Room while a big key frame goes out (hundreds of UDP packets); CHANNEL_BACKLOG decides about skipping.
+    let (frames_tx, mut frames) = mpsc::channel::<Vec<u8>>(8);
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2000];
         let mut channel = None;
@@ -284,7 +289,7 @@ async fn stream(
     viewers: &mut mpsc::Receiver<Viewer>,
     lan: IpAddr,
 ) -> Result<Option<Viewer>> {
-    let Viewer { mut writer, mut requests, requests_tx, peer } = viewer;
+    let Viewer { mut writer, mut requests, requests_tx, peer, screen } = viewer;
     // The WebSocket writer runs apart from encoding: a full queue means the link is behind, so skip.
     let (ws_tx, mut ws_rx) = mpsc::channel::<Vec<u8>>(2);
     let writing = tokio::spawn(async move {
@@ -300,7 +305,9 @@ async fn stream(
 
     let fps = args.fps;
     let latest = Arc::new(LatestFrame::default());
-    let cap = Capture::start(args.display, args.window.as_deref(), args.width, fps, latest.clone(), None)?;
+    let bounds = screen.unwrap_or(capture::box_16_9(args.width));
+    let cap = Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
+    info!("browser {peer}: screen {bounds:?}, sending {}x{}", cap.width, cap.height);
     let mut bitrate = args.bitrate;
     let mut encoder = VideoEncoder::new(Codec::H264High, cap.width, cap.height, fps, bitrate)?;
     let origin = Instant::now();

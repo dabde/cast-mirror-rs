@@ -94,7 +94,7 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
     let mut ladder = Ladder::starting_at(rate.bitrate);
     let (width, fps) = if args.auto { (LADDER[ladder.rung].0, LADDER[ladder.rung].1) } else { (args.width, args.fps) };
     let latest = Arc::new(LatestFrame::default());
-    let mut cap = Capture::start(args.display, args.window.as_deref(), width, fps, latest.clone(), None)?;
+    let mut cap = Capture::start(args.display, args.window.as_deref(), capture::box_16_9(width), fps, latest.clone(), None)?;
     let mut encoder = VideoEncoder::new(codec, cap.width, cap.height, fps, rate.bitrate)?;
     encoder.set_max_qp(args.max_qp);
     let describe = |cap: &Capture, fps: u32, bitrate: u32| {
@@ -184,7 +184,7 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
                             let (w, f, _) = LADDER[ladder.rung];
                             drop(cap);
                             (cap, encoder) = tokio::task::block_in_place(|| -> Result<_> {
-                                let cap = Capture::start(args.display, args.window.as_deref(), w, f, latest.clone(), None)?;
+                                let cap = Capture::start(args.display, args.window.as_deref(), capture::box_16_9(w), f, latest.clone(), None)?;
                                 let encoder = VideoEncoder::new(codec, cap.width, cap.height, f, rate.bitrate)?;
                                 Ok((cap, encoder))
                             })?;

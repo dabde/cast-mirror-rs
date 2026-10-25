@@ -231,7 +231,10 @@
     ws = new WebSocket(`wss://${location.host}/ws`);
     ws.binaryType = "arraybuffer";
     ws.onopen = () => {
-      ws.send(JSON.stringify({token}));
+      // The screen in pixels, landscape: the Mac sends exactly that, so the picture isn't scaled again.
+      const ratio = window.devicePixelRatio || 1;
+      const a = Math.round(screen.width * ratio), b = Math.round(screen.height * ratio);
+      ws.send(JSON.stringify({token, width: Math.max(a, b), height: Math.min(a, b)}));
       show("Waiting for the picture…");
       startWebRtc().catch((e) => console.warn("WebRTC", e));
     };
