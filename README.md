@@ -158,6 +158,9 @@ Android's compositor and the panel, about four 60 Hz refreshes. The compositor a
 buffer to the screen (`dumpsys SurfaceFlinger --latency`, 1.5 refreshes). Drawing each frame with an own OpenGL
 thread onto a SurfaceView (instead of TextureView waiting for the UI thread) stayed on the graphics plane but made
 no difference, neither in the compositor (23.8 vs 24.5 ms) nor on the lag wheel, so it was dropped.
+Android offers apps on this TV a single 60 Hz mode (`dumpsys display`: no alternative refresh rates, no ALLM,
+no minimal post-processing), so ~90 ms is about the floor of the app path here; lower needs a receiver on an
+HDMI input in Game mode, e.g. an Android TV box running the same app.
 
 MJPEG was checked and dropped: the TV has a hardware decoder for it (`OMX.MTK.VIDEO.DECODER.MJPEG`) and
 VideoToolbox encodes JPEG in hardware in ~2 ms, but a 1670x1080 desktop frame is 137 KB at quality 0.5 (67 Mbit/s
