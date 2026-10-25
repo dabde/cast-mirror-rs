@@ -278,6 +278,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-video-toolbox",
  "opus",
+ "ring",
  "screencapturekit",
  "tao",
  "tokio",

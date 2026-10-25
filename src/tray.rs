@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chromiacast::discover;
 use clap::Parser;
 use tao::event::{Event, StartCause};
@@ -347,9 +347,6 @@ pub fn run() -> Result<()> {
                     let rt = tokio::runtime::Runtime::new()?;
                     rt.block_on(async {
                         if direct {
-                            (control.status)("Starting the TV app over ADB…".into());
-                            // The TV's graphics plane is 1080p: above that, use the (slower) 4K video plane.
-                            start_tv_app(args.device.as_deref().unwrap_or_default(), args.width <= 1920).await?;
                             crate::direct::run(args, control).await
                         } else {
                             mirror::run(args, Source::Screen, control).await
@@ -436,46 +433,14 @@ fn relaunch_after_exit() -> Result<()> {
     Ok(())
 }
 
-/// (Re)starts the receiver app (android/) over ADB; network debugging must be enabled on the TV.
-/// `gpu`: draw on the graphics plane (fast, 1080p max) instead of the video plane (4K, ~85 ms slower).
-async fn start_tv_app(host: &str, gpu: bool) -> Result<()> {
-    let serial = format!("{host}:5555");
-    let ten = Duration::from_secs(10);
-    adb(&["connect", &serial], ten).await.context("running adb (brew install --cask android-platform-tools)")?;
-    // -S restarts the activity, so a changed plane choice takes effect.
-    let texture = gpu.to_string();
-    let activity = format!("{TV_APP}/.MainActivity");
-    let out = adb(&["-s", &serial, "shell", "am", "start", "-S", "-n", &activity, "--ez", "texture", &texture], ten).await?;
-    let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
-    if !out.status.success() || text.contains("Error") {
-        anyhow::bail!("TV app not started on {host}: {}", text.trim());
-    }
-    // Give the app a moment to open its socket.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    Ok(())
-}
-
-const TV_APP: &str = "de.tisth.castmirror";
-
-/// Runs adb, which can hang on an unreachable TV, for at most `limit`.
-async fn adb(args: &[&str], limit: Duration) -> Result<std::process::Output> {
-    // Finder-launched apps get a minimal PATH, so look where Homebrew puts adb too.
-    let path = ["/opt/homebrew/bin/adb", "/usr/local/bin/adb"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or("adb");
-    let out = tokio::process::Command::new(path).args(args).kill_on_drop(true).output();
-    Ok(tokio::time::timeout(limit, out).await.context("adb timed out")??)
-}
-
 /// Whether the receiver at `host` is an Android TV with network ADB authorized for us and the TV app installed.
 async fn tv_app_installed(host: String) -> bool {
     let serial = format!("{host}:5555");
     let limit = Duration::from_secs(3);
     let stdout = |o: std::process::Output| String::from_utf8_lossy(&o.stdout).into_owned();
-    let connected = adb(&["connect", &serial], limit).await.map(stdout).is_ok_and(|s| s.contains("connected to"));
+    let connected = crate::direct::adb(&["connect", &serial], limit).await.map(stdout).is_ok_and(|s| s.contains("connected to"));
     connected
-        && adb(&["-s", &serial, "shell", "pm", "path", TV_APP], limit)
+        && crate::direct::adb(&["-s", &serial, "shell", "pm", "path", crate::direct::TV_APP], limit)
             .await
             .map(stdout)
             .is_ok_and(|s| s.contains("package:"))

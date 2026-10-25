@@ -138,7 +138,13 @@ The TV's video plane runs its picture processing (~85 ms); `--ez texture false` 
 Declaring the app a game (`GAME=1 ./build.sh`) makes no difference on this Philips. The decoder rejects
 Android's KEY_LOW_LATENCY but accepts MediaTek's `vdec-lowlatency`.
 
-**Loss and congestion (protocol v2):** the app NACKs missing packets (and whole missing frames) and the sender
+**Encryption (protocol v3):** every packet in both directions is AES-128-GCM sealed: payload encrypted,
+header authenticated, a counter per packet as nonce, so resends get fresh nonces. The key is random per session
+and reaches the app with the start intent over ADB, which the TV authenticated when it accepted this Mac; that is
+why `--direct` now starts the app itself. Started by hand without a key, the app only asks to cast from the Mac.
+Cost: 24 bytes per packet (payload 1376 instead of 1400); fps unchanged in a 2 % loss test.
+
+**Loss and congestion:** the app NACKs missing packets (and whole missing frames) and the sender
 resends them from a 120-frame history; a frame is only given up after 60 ms without progress while a later one is
 complete, then a key frame is requested (at most one per 500 ms). Every 100 ms the app reports received/expected
 packets and the minimum one-way delay. The sender cuts the bitrate when the queue grows (> 30 ms, down to 85 % of
@@ -153,7 +159,7 @@ and `CAST_MIRROR_CAP_KBPS=3000` (queue stays under ~40 ms, settles on 720p30 at 
 
 The TV's graphics plane is 1920x1080 (`wm size` override on a 3840x2160 panel), so the fast GPU path is
 1080p at most. The tray restarts the app on the 4K video plane for profiles wider than 1920 (Presentation):
-sharp, but ~85 ms slower. By hand: `adb shell am start -S -n de.tisth.castmirror/.MainActivity --ez texture false`.
+sharp, but ~85 ms slower.
 
 Tray: a TV with the app installed and network ADB authorized shows up a second time under Receiver as
 "<name> · TV app"; picking it starts the app over ADB and streams HEVC. Not yet: audio. The Chromecast dongle

@@ -1,17 +1,21 @@
-//! `--direct`: frames over plain UDP to the cast-mirror Android TV app (android/), no Cast buffering.
+//! `--direct`: frames over UDP to the cast-mirror Android TV app (android/), no Cast buffering.
 //!
-//! Packet (v2): "CM" | 2 | flags (bit0 key, bit1 HEVC, bit2 retransmit) | frame u32 | index u16 | count u16 |
-//!   seq u32 | send ms u32 | payload.
-//! From the app: 'K' key frame request; 'N' frame u32, n u16, n x index u16 (missing packets;
-//!   n = 0xffff: the whole frame);
-//! 'R' every 100 ms: received u32, expected u32, minimum one-way delay ms i32, frames given up u32.
+//! Packet (v3): "CM" | 3 | flags (bit0 key, bit1 HEVC, bit2 retransmit) | frame u32 | index u16 | count u16 |
+//!   seq u32 | send ms u32 | counter u64 | AES-128-GCM(payload) with a 16-byte tag over everything before it.
+//! From the app, as counter u64 | AES-128-GCM(message): 'K' key frame request; 'N' frame u32, n u16,
+//!   n x index u16 (missing packets; n = 0xffff: the whole frame); 'R' every 100 ms: received u32,
+//!   expected u32, minimum one-way delay ms i32, frames given up u32.
+//! The nonce is direction (0: to the app, 1: from it) | 0 0 0 | counter. A fresh random key per session
+//! reaches the app over ADB, which the TV authenticated when it accepted this Mac.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
+use ring::rand::SecureRandom;
 use tokio::net::UdpSocket;
 use tracing::info;
 
@@ -21,8 +25,10 @@ use crate::{Codec, MirrorArgs};
 
 pub const PORT: u16 = 7010;
 const HEADER: usize = 20;
-// Stays under a 1500-byte MTU with IP/UDP headers.
-const PAYLOAD: usize = 1400;
+const COUNTER: usize = 8;
+const TAG: usize = 16;
+// With header, counter and tag this stays under a 1500-byte MTU with IP/UDP headers.
+const PAYLOAD: usize = 1376;
 // Frames kept for retransmission: ~2 s at 60 fps, far beyond the app's 60 ms give-up deadline.
 const HISTORY: usize = 120;
 const MIN_BITRATE: u32 = 400_000;
@@ -44,9 +50,15 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
         .parse()
         .or_else(|_| format!("{device}:{PORT}").parse())
         .with_context(|| format!("not an address: {device}"))?;
+    let mut key = [0u8; 16];
+    ring::rand::SystemRandom::new().fill(&mut key).map_err(|_| anyhow::anyhow!("no system randomness"))?;
+    (control.status)("Starting the TV app over ADB…".into());
+    // The TV's graphics plane is 1080p: above that, use the (slower) 4K video plane.
+    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+    start_tv_app(&addr.ip().to_string(), args.width <= 1920, &hex).await?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(addr).await?;
-    let mut link = Link::new(socket);
+    let mut link = Link::new(socket, Crypto::new(&key));
 
     let codec = args.codecs.first().copied().unwrap_or(Codec::H264);
     let hevc = codec == Codec::Hevc;
@@ -88,18 +100,21 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
             r = link.socket.recv(&mut feedback) => {
                 // ECONNREFUSED here just means the app isn't listening yet.
                 let Ok(n) = r else { continue };
-                match feedback[..n] {
+                // Anything that doesn't decrypt is not from our app (or was altered on the way).
+                let Some(msg) = link.crypto.open(&mut feedback[..n], 0, FROM_APP) else { continue };
+                let n = msg.len();
+                match *msg {
                     // The app repeats 'K' every 200 ms until a key frame lands; one per 500 ms is enough,
                     // or a slow link ends up sending nothing but key frames.
                     [b'K', ..] => need_key |= last_key.is_none_or(|t| t.elapsed() >= KEY_INTERVAL),
                     [b'N', ..] if n >= 7 => {
-                        let frame_id = u32::from_be_bytes(feedback[1..5].try_into().unwrap());
-                        let whole = feedback[5..7] == [0xff, 0xff];
+                        let frame_id = u32::from_be_bytes(msg[1..5].try_into().unwrap());
+                        let whole = msg[5..7] == [0xff, 0xff];
                         if let Some((_, packets)) = history.iter().find(|(f, _)| *f == frame_id) {
                             let indices: Vec<usize> = if whole {
                                 (0..packets.len()).collect()
                             } else {
-                                feedback[7..n].as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c) as usize).collect()
+                                msg[7..n].as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c) as usize).collect()
                             };
                             for i in indices.into_iter().filter(|&i| i < packets.len()) {
                                 let mut p = packets[i].clone();
@@ -111,7 +126,7 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
                         stats.nacks += 1;
                     }
                     [b'R', ..] if n >= 17 => {
-                        let field = |o: usize| u32::from_be_bytes(feedback[o..o + 4].try_into().unwrap());
+                        let field = |o: usize| u32::from_be_bytes(msg[o..o + 4].try_into().unwrap());
                         let fb = Report { received: field(1), expected: field(5), owd_ms: field(9) as i32, given_up: field(13) };
                         stats.loss = fb.loss();
                         let now = Instant::now();
@@ -199,7 +214,7 @@ fn packetize(id: u32, flags: u8, seq: &mut u32, sent_ms: u32, data: &[u8]) -> Ve
         .map(|(i, chunk)| {
             *seq = seq.wrapping_add(1);
             let mut p = Vec::with_capacity(HEADER + chunk.len());
-            p.extend_from_slice(&[b'C', b'M', 2, flags]);
+            p.extend_from_slice(&[b'C', b'M', 3, flags]);
             p.extend_from_slice(&id.to_be_bytes());
             p.extend_from_slice(&(i as u16).to_be_bytes());
             p.extend_from_slice(&count.to_be_bytes());
@@ -216,13 +231,14 @@ fn packetize(id: u32, flags: u8, seq: &mut u32, sent_ms: u32, data: &[u8]) -> Ve
 /// router in front of a slow link, while capture and encoding go on.
 struct Link {
     socket: Arc<UdpSocket>,
+    crypto: Crypto,
     drop: f64,
     paced: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     rng: u64,
 }
 
 impl Link {
-    fn new(socket: UdpSocket) -> Self {
+    fn new(socket: UdpSocket, crypto: Crypto) -> Self {
         let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
         let socket = Arc::new(socket);
         let cap_bps = env("CAST_MIRROR_CAP_KBPS") * 1000.0;
@@ -239,10 +255,12 @@ impl Link {
             });
             tx
         });
-        Self { socket, drop: env("CAST_MIRROR_DROP"), paced, rng: 0x9e37_79b9_7f4a_7c15 }
+        Self { socket, crypto, drop: env("CAST_MIRROR_DROP"), paced, rng: 0x9e37_79b9_7f4a_7c15 }
     }
 
+    /// Encrypts on every send, resends included: their flags differ, so they need a fresh nonce.
     async fn send(&mut self, packet: &[u8]) {
+        let packet = &self.crypto.seal(packet, HEADER, TO_APP)[..];
         if self.drop > 0.0 {
             // xorshift: cheap and good enough for a loss simulation.
             self.rng ^= self.rng << 13;
@@ -261,6 +279,89 @@ impl Link {
             }
         }
     }
+}
+
+const TO_APP: u8 = 0;
+const FROM_APP: u8 = 1;
+
+/// AES-128-GCM in both directions; a counter per sent message makes each nonce unique.
+// ponytail: no replay window; a replayed video packet is a duplicate the app drops anyway, a replayed
+// NACK costs one resend. Add a window if feedback ever carries something that must not repeat.
+struct Crypto {
+    key: LessSafeKey,
+    sent: u64,
+}
+
+impl Crypto {
+    fn new(key: &[u8; 16]) -> Self {
+        Self { key: LessSafeKey::new(UnboundKey::new(&AES_128_GCM, key).expect("16-byte key")), sent: 0 }
+    }
+
+    fn nonce(direction: u8, counter: u64) -> Nonce {
+        let mut n = [0u8; 12];
+        n[0] = direction;
+        n[4..].copy_from_slice(&counter.to_be_bytes());
+        Nonce::assume_unique_for_key(n)
+    }
+
+    /// `message[..clear]` stays readable, then comes the counter; both are authenticated.
+    fn seal(&mut self, message: &[u8], clear: usize, direction: u8) -> Vec<u8> {
+        let counter = self.sent;
+        self.sent += 1;
+        let mut out = Vec::with_capacity(message.len() + COUNTER + TAG);
+        out.extend_from_slice(&message[..clear]);
+        out.extend_from_slice(&counter.to_be_bytes());
+        let mut body = message[clear..].to_vec();
+        self.key
+            .seal_in_place_append_tag(Self::nonce(direction, counter), Aad::from(&out[..]), &mut body)
+            .expect("AES-GCM seal");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The decrypted message, or `None` if it doesn't authenticate.
+    fn open<'a>(&self, message: &'a mut [u8], clear: usize, direction: u8) -> Option<&'a [u8]> {
+        if message.len() < clear + COUNTER + TAG {
+            return None;
+        }
+        let (aad, body) = message.split_at_mut(clear + COUNTER);
+        let counter = u64::from_be_bytes(aad[clear..].try_into().unwrap());
+        self.key.open_in_place(Self::nonce(direction, counter), Aad::from(&*aad), body).ok().map(|p| &*p)
+    }
+}
+
+/// (Re)starts the receiver app (android/) over ADB; network debugging must be enabled on the TV.
+/// `gpu`: draw on the graphics plane (fast, 1080p max) instead of the video plane (4K, ~85 ms slower).
+/// `key`: the session's AES key, in hex; ADB is authenticated, so it reaches only this TV.
+async fn start_tv_app(host: &str, gpu: bool, key: &str) -> Result<()> {
+    let serial = format!("{host}:5555");
+    let ten = Duration::from_secs(10);
+    adb(&["connect", &serial], ten).await.context("running adb (brew install --cask android-platform-tools)")?;
+    // -S restarts the activity, so a changed plane choice takes effect.
+    let texture = gpu.to_string();
+    let activity = format!("{TV_APP}/.MainActivity");
+    let args = ["-s", &serial, "shell", "am", "start", "-S", "-n", &activity, "--ez", "texture", &texture, "--es", "key", key];
+    let out = adb(&args, ten).await?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || text.contains("Error") {
+        bail!("TV app not started on {host}: {}", text.trim());
+    }
+    // Give the app a moment to open its socket.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    Ok(())
+}
+
+pub const TV_APP: &str = "de.tisth.castmirror";
+
+/// Runs adb, which can hang on an unreachable TV, for at most `limit`.
+pub async fn adb(args: &[&str], limit: Duration) -> Result<std::process::Output> {
+    // Finder-launched apps get a minimal PATH, so look where Homebrew puts adb too.
+    let path = ["/opt/homebrew/bin/adb", "/usr/local/bin/adb"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .unwrap_or("adb");
+    let out = tokio::process::Command::new(path).args(args).kill_on_drop(true).output();
+    Ok(tokio::time::timeout(limit, out).await.context("adb timed out")??)
 }
 
 struct Report {
@@ -433,14 +534,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn packets_carry_v2_header_and_split_payload() {
+    fn packets_carry_v3_header_and_split_payload() {
         let data = vec![7u8; PAYLOAD + 10];
         let mut seq = 41;
         let packets = packetize(0x01020304, 3, &mut seq, 0x0a0b0c0d, &data);
         assert_eq!(packets.len(), 2);
-        assert_eq!(&packets[0][..HEADER], &[b'C', b'M', 2, 3, 1, 2, 3, 4, 0, 0, 0, 2, 0, 0, 0, 42, 10, 11, 12, 13]);
+        assert_eq!(&packets[0][..HEADER], &[b'C', b'M', 3, 3, 1, 2, 3, 4, 0, 0, 0, 2, 0, 0, 0, 42, 10, 11, 12, 13]);
         assert_eq!(&packets[1][8..16], &[0, 1, 0, 2, 0, 0, 0, 43]);
         assert_eq!(packets[0].len() + packets[1].len() - 2 * HEADER, data.len());
+    }
+
+    #[test]
+    fn sealed_packets_fit_the_mtu_open_once_and_reject_tampering() {
+        let key = [9u8; 16];
+        let (mut sender, app) = (Crypto::new(&key), Crypto::new(&key));
+        let packet = packetize(1, 0, &mut 0, 0, &vec![5u8; PAYLOAD]).remove(0);
+        let mut sealed = sender.seal(&packet, HEADER, TO_APP);
+        assert!(sealed.len() + 28 <= 1500, "{} bytes on the wire", sealed.len() + 28);
+        assert_eq!(&sealed[..HEADER], &packet[..HEADER], "header stays readable");
+        assert_eq!(app.open(&mut sealed.clone(), HEADER, TO_APP).unwrap(), &packet[HEADER..]);
+        assert!(app.open(&mut sealed.clone(), HEADER, FROM_APP).is_none(), "direction is part of the nonce");
+        sealed[3] |= 4; // A forged retransmit flag in the readable header.
+        assert!(app.open(&mut sealed, HEADER, TO_APP).is_none());
+        let resend = sender.seal(&packet, HEADER, TO_APP);
+        assert_ne!(resend[HEADER..HEADER + COUNTER], sealed[HEADER..HEADER + COUNTER], "fresh counter per send");
     }
 
     fn report(received: u32, expected: u32, owd_ms: i32) -> Report {
@@ -468,10 +585,10 @@ mod tests {
     fn queue_cut_drops_to_delivered_rate() {
         let t0 = Instant::now();
         let mut rc = RateControl::new(6_000_000);
-        // 20 packets per 100 ms get through: 2.24 Mbit/s on a link we feed with 6 Mbit/s.
+        // 20 packets per 100 ms get through: 2.2 Mbit/s on a link we feed with 6 Mbit/s.
         rc.on_report(t0, &report(20, 20, 50));
         let cut = rc.on_report(t0 + Duration::from_millis(100), &report(20, 20, 300));
-        assert_eq!(cut, Some(1_904_000), "85 % of the delivered 2.24 Mbit/s, not just -15 %");
+        assert_eq!(cut, Some(1_871_360), "85 % of the delivered 2.2 Mbit/s, not just -15 %");
     }
 
     #[test]

@@ -18,6 +18,10 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 
 import java.io.IOException;
+import java.security.GeneralSecurityException;
+import javax.crypto.Cipher;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.Inet4Address;
@@ -35,18 +39,28 @@ import java.util.TreeMap;
  * Low-latency receiver for `cast-mirror --direct`: UDP frames straight into the hardware decoder,
  * each decoded frame rendered at once (no jitter buffer).
  *
- * Packet (v2): "CM" | 2 | flags (bit0 key, bit1 HEVC, bit2 retransmit) | frame u32 | index u16 | count u16 |
- *   seq u32 | send ms u32 | payload.
- * Back to the sender: 'K' key frame request; 'N' frame u32, n u16, n x index u16 (missing packets;
- *   n = 0xffff: the whole frame);
- * 'R' every 100 ms: received u32, expected u32, minimum one-way delay ms i32, frames given up u32.
+ * Packet (v3): "CM" | 3 | flags (bit0 key, bit1 HEVC, bit2 retransmit) | frame u32 | index u16 | count u16 |
+ *   seq u32 | send ms u32 | counter u64 | AES-128-GCM(payload), the tag covering everything before it.
+ * Back to the sender, as counter u64 | AES-128-GCM(message): 'K' key frame request; 'N' frame u32, n u16,
+ *   n x index u16 (missing packets; n = 0xffff: the whole frame); 'R' every 100 ms: received u32,
+ *   expected u32, minimum one-way delay ms i32, frames given up u32.
+ * Nonce: direction (0 to the app, 1 from it) | 0 0 0 | counter. The key comes with the start intent.
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback, TextureView.SurfaceTextureListener {
     static final int PORT = 7010;
     static final int HEADER = 20;
+    static final int COUNTER = 8;
+    static final int GCM_TAG = 16;
+    static final byte TO_APP = 0;
+    static final byte FROM_APP = 1;
     static final String TAG = "CastMirror";
 
     private volatile boolean running;
+    // AES-128-GCM session key from the sender's `am start --es key`; ADB authenticated that sender.
+    private SecretKeySpec key;
+    private Cipher opener;
+    private Cipher sealer;
+    private long sent;
     private Thread receiver;
     private TextView label;
 
@@ -73,7 +87,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
         label.setBackgroundColor(Color.BLACK); // Covers the last frame once the sender is gone.
         label.setTextSize(28);
         label.setGravity(Gravity.CENTER);
-        label.setText("Cast Mirror receiver\n" + localAddress() + ":" + PORT + "\n\nwaiting for cast-mirror --direct");
+        String hex = getIntent().getStringExtra("key");
+        if (hex != null && hex.length() == 32) {
+            byte[] bytes = new byte[16];
+            for (int i = 0; i < 16; i++) {
+                bytes[i] = (byte) Integer.parseInt(hex.substring(2 * i, 2 * i + 2), 16);
+            }
+            key = new SecretKeySpec(bytes, "AES");
+        }
+        label.setText(key == null
+                ? "Cast Mirror receiver\n\nStart casting from the Mac:\nit starts this app with the session key."
+                : "Cast Mirror receiver\n" + localAddress() + ":" + PORT + "\n\nwaiting for cast-mirror --direct");
         root.addView(label, new FrameLayout.LayoutParams(-1, -1));
         setContentView(root);
     }
@@ -89,6 +113,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     }
 
     private void start(Surface surface) {
+        if (key == null) {
+            return; // Without the key nothing would decrypt.
+        }
         running = true;
         receiver = new Thread(() -> receive(surface), "receiver");
         receiver.start();
@@ -127,17 +154,45 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     private MediaCodec codec;
     private boolean codecHevc;
 
+    private static byte[] nonce(byte direction, long counter) {
+        return ByteBuffer.allocate(12).put(direction).put(new byte[3]).putLong(counter).array();
+    }
+
     // Feedback is best effort: a failed send (e.g. Wi-Fi briefly gone) must not end the receive loop.
-    private static void send(DatagramSocket socket, byte[] data, int length, SocketAddress to) {
+    private void send(DatagramSocket socket, byte[] data, int length, SocketAddress to) {
         try {
-            socket.send(new DatagramPacket(data, length, to));
-        } catch (IOException e) {
+            long counter = sent++;
+            byte[] out = new byte[COUNTER + length + GCM_TAG];
+            ByteBuffer.wrap(out).putLong(counter);
+            sealer.init(Cipher.ENCRYPT_MODE, key, new GCMParameterSpec(128, nonce(FROM_APP, counter)));
+            sealer.updateAAD(out, 0, COUNTER);
+            sealer.doFinal(data, 0, length, out, COUNTER);
+            socket.send(new DatagramPacket(out, out.length, to));
+        } catch (IOException | GeneralSecurityException e) {
             Log.w(TAG, "feedback not sent: " + e);
+        }
+    }
+
+    // Decrypts a v3 packet in place (payload lands at HEADER); returns its length, or -1 if it doesn't
+    // authenticate: not from our sender, or altered on the way.
+    private int open(byte[] buf, int n) {
+        if (n < HEADER + COUNTER + GCM_TAG) {
+            return -1;
+        }
+        try {
+            long counter = ByteBuffer.wrap(buf, HEADER, COUNTER).getLong();
+            opener.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(128, nonce(TO_APP, counter)));
+            opener.updateAAD(buf, 0, HEADER + COUNTER);
+            return opener.doFinal(buf, HEADER + COUNTER, n - HEADER - COUNTER, buf, HEADER);
+        } catch (GeneralSecurityException e) {
+            return -1;
         }
     }
 
     private void receive(Surface surface) {
         try (DatagramSocket socket = new DatagramSocket(PORT)) {
+            opener = Cipher.getInstance("AES/GCM/NoPadding");
+            sealer = Cipher.getInstance("AES/GCM/NoPadding");
             socket.setSoTimeout(2);
             socket.setReceiveBufferSize(4 << 20);
             byte[] buf = new byte[2048];
@@ -183,7 +238,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                 // silent for 300 ms (a restart), so two concurrent senders don't ping-pong the decoder.
                 boolean foreign = got && sender != null && !sender.equals(packet.getSocketAddress())
                         && now - lastPacket < 300;
-                if (got && !foreign && n >= HEADER && buf[0] == 'C' && buf[1] == 'M' && buf[2] == 2) {
+                int plain = -1;
+                if (got && !foreign && n >= HEADER && buf[0] == 'C' && buf[1] == 'M' && buf[2] == 3) {
+                    plain = open(buf, n);
+                }
+                if (plain >= 0) {
+                    n = HEADER + plain;
                     sender = packet.getSocketAddress();
                     lastPacket = now;
                     int flags = buf[3];
