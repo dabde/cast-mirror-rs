@@ -5,6 +5,7 @@ mod mirror;
 mod pairing;
 mod tray;
 mod video;
+mod virtual_display;
 mod web;
 #[cfg(feature = "vp8")]
 mod vp8;
@@ -71,6 +72,10 @@ pub struct MirrorArgs {
     pub delay: u64,
     #[arg(long)]
     pub no_audio: bool,
+    /// Extend the desktop: stream a new virtual display (a second monitor at the receiver's size) instead of
+    /// mirroring one.
+    #[arg(long)]
+    pub extend: bool,
     /// Display index as listed by ScreenCaptureKit.
     #[arg(long, default_value_t = 0)]
     pub display: usize,

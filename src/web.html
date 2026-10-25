@@ -56,8 +56,12 @@
 <!-- Decoding and drawing run in a worker, away from the main thread's other work. Frames reach it from
      the main thread, which owns the connections (WebRTC isn't available in workers). -->
 <script id="worker" type="text/plain">
-  // Frames: flags u8 (bit0 key) | frame u32 | timestamp µs u64 | H.264 Annex B. Over the data channel they
+  // Frames: flags u8 (bit0 key) | frame u32 | timestamp µs u64 | piece u16 | pieces u16 | H.264 Annex B.
+  // Big frames come in pieces (data channel messages are limited to 256 KB). Over the data channel they
   // can arrive out of order or not at all (it gives up after 100 ms of retries).
+  const HEADER = 17;
+  // Frame id → its pieces so far.
+  const partial = new Map();
   const LOST_AFTER_MS = 120;
   let canvas, ctx, decoder;
   let configured = false;
@@ -120,6 +124,7 @@
     expected = null;
     configured = false;
     pending.clear();
+    partial.clear();
     up("k");
   }
 
@@ -127,7 +132,7 @@
     const view = new DataView(buffer);
     const key = (view.getUint8(0) & 1) === 1;
     const timestamp = Number(view.getBigUint64(5));
-    const data = new Uint8Array(buffer, 13);
+    const data = new Uint8Array(buffer, HEADER);
     if (!configured) {
       if (!key) return;
       decoder.configure({codec: codecOf(data), optimizeForLatency: true, hardwareAcceleration: "prefer-hardware"});
@@ -201,16 +206,45 @@
       expected = null;
       configured = false;
       pending.clear();
+      partial.clear();
     } else if (e.data.reset) {
       // A new connection: frame numbers start over.
       pending.clear();
+      partial.clear();
       expected = null;
       shown = false;
       newDecoder();
     } else {
-      const buffer = e.data;
-      const id = new DataView(buffer).getUint32(1);
+      const view = new DataView(e.data);
+      const id = view.getUint32(1);
       if (expected !== null && id < expected) return; // Late: already past it.
+      const piece = view.getUint16(13);
+      const pieces = view.getUint16(15);
+      let buffer = e.data;
+      if (pieces > 1) {
+        let p = partial.get(id);
+        if (!p) {
+          p = {parts: new Array(pieces), got: 0};
+          partial.set(id, p);
+        }
+        if (!p.parts[piece]) {
+          p.parts[piece] = new Uint8Array(e.data, HEADER);
+          p.got++;
+        }
+        if (p.got < pieces) return;
+        partial.delete(id);
+        const size = p.parts.reduce((sum, part) => sum + part.length, 0);
+        const whole = new Uint8Array(HEADER + size);
+        whole.set(new Uint8Array(e.data, 0, HEADER));
+        let at = HEADER;
+        for (const part of p.parts) {
+          whole.set(part, at);
+          at += part.length;
+        }
+        buffer = whole.buffer;
+      }
+      // Pieces of frames already given up never complete.
+      for (const old of partial.keys()) if (expected !== null && old < expected) partial.delete(old);
       pending.set(id, buffer);
       drain();
     }
@@ -220,6 +254,7 @@
 <script>
   const msg = document.getElementById("msg");
   const token = location.hash.slice(1);
+  const VERSION = "__PAGE_VERSION__";
   let ws = null;
   let pc = null;
   let channel = null;
@@ -243,6 +278,9 @@
     if (typeof data === "string") {
       if (data[0] === "p") {
         sendUp("e" + data.slice(1));
+      } else if (data[0] === "v") {
+        // The Mac serves a newer page: load it.
+        location.reload();
       } else if (data === "r") {
         worker.postMessage({restart: true});
       } else if (data[0] === "{") {
@@ -274,6 +312,7 @@
       const ratio = window.devicePixelRatio || 1;
       ws.send(JSON.stringify({
         token,
+        version: VERSION,
         width: Math.round(window.innerWidth * ratio),
         height: Math.round(window.innerHeight * ratio),
       }));

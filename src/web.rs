@@ -4,7 +4,9 @@
 //!
 //! The page link carries a random token in its fragment (never sent in an HTTP request); the page sends it
 //! as its first WebSocket message, then a WebRTC offer. Frames: flags u8 (bit0 key) | frame u32 |
-//! timestamp µs u64 | H.264 Annex B. The page opens the channel unordered with at most 100 ms of
+//! timestamp µs u64 | piece u16 | pieces u16 | H.264 Annex B (that piece of it).
+//! Browsers take data channel messages up to 256 KB, and a sharp key frame is bigger: frames go out in
+//! pieces of at most CHUNK bytes, which the page puts back together. The page opens the channel unordered with at most 100 ms of
 //! retransmissions, so a lost piece costs a retry instead of holding up later frames (TCP did that: round
 //! trips up to 216 ms on Wi-Fi); a frame still missing is given up and the page asks for a key frame ("k").
 
@@ -33,6 +35,8 @@ const MIN_BITRATE: u32 = 1_000_000;
 // More than this waiting in the data channel means the link is behind: skip rather than queue. Room for a
 // key frame (over 300 KB at 30 Mbit/s) plus a few more, or each key frame would cause the next skip.
 const CHANNEL_BACKLOG: usize = 1024 * 1024;
+const HEADER: usize = 17;
+const CHUNK: usize = 60 * 1024;
 // Forced key frames at most this often: each one is large, and a skip right after it would ask again.
 const KEY_INTERVAL: Duration = Duration::from_millis(500);
 // Pings carry µs since this instant; echoes turn into round-trip times.
@@ -134,7 +138,8 @@ async fn serve(
     let request = read_request(&mut tls).await?;
     let path = request.split_whitespace().nth(1).unwrap_or("/");
     if path != "/ws" {
-        let body = PAGE.as_bytes();
+        let page = PAGE.replace("__PAGE_VERSION__", &page_version());
+        let body = page.as_bytes();
         let head = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
             body.len()
@@ -164,6 +169,12 @@ async fn serve(
     let hello: serde_json::Value = serde_json::from_slice(&hello).unwrap_or_default();
     if opcode != 1 || hello["token"].as_str() != Some(token) {
         bail!("wrong token");
+    }
+    // A page that reconnected on its own after an update still runs the old code: it reloads on a mismatch.
+    if hello["version"].as_str() != Some(page_version().as_str()) {
+        let mut writer = writer;
+        writer.write_all(&frame_bytes(1, format!("v{}", page_version()).as_bytes())).await?;
+        bail!("page out of date, told it to reload");
     }
     let pixels = |key: &str| hello[key].as_u64().map(|v| v as u32).filter(|v| (320..=7680).contains(v));
     let screen = pixels("width").zip(pixels("height"));
@@ -272,13 +283,26 @@ async fn webrtc(
                 frame = frames.recv() => {
                     let Some(frame) = frame else { return };
                     let Some(mut ch) = channel.and_then(|id| rtc.channel(id)) else { continue };
-                    let (binary, message) = match frame.split_first() {
-                        // Text (pings) is marked by a leading 0xff; video frames start with their flags (0 or 1).
-                        Some((0xff, text)) => (false, text),
-                        _ => (true, &frame[..]),
-                    };
-                    if ch.buffered_amount() > CHANNEL_BACKLOG || !ch.write(binary, message).unwrap_or(false) {
+                    // Text (pings) is marked by a leading 0xff; video frames start with their flags (0 or 1).
+                    if let Some((0xff, text)) = frame.split_first() {
+                        let _ = ch.write(false, text);
+                        continue;
+                    }
+                    if ch.buffered_amount() > CHANNEL_BACKLOG {
                         let _ = requests.try_send(Request::Skipped);
+                        continue;
+                    }
+                    let pieces = frame[HEADER..].chunks(CHUNK).collect::<Vec<_>>();
+                    for (i, piece) in pieces.iter().enumerate() {
+                        let mut message = Vec::with_capacity(HEADER + piece.len());
+                        message.extend_from_slice(&frame[..13]);
+                        message.extend_from_slice(&(i as u16).to_be_bytes());
+                        message.extend_from_slice(&(pieces.len() as u16).to_be_bytes());
+                        message.extend_from_slice(piece);
+                        if !ch.write(true, &message).unwrap_or(false) {
+                            let _ = requests.try_send(Request::Skipped);
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -317,7 +341,17 @@ async fn stream(
     let fps = args.fps;
     let latest = Arc::new(LatestFrame::default());
     let mut bounds = screen.unwrap_or(capture::box_16_9(args.width));
-    let mut cap = Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
+    // A second monitor at the view's exact size; Retina (half the points) for a close-up screen.
+    let hidpi = |(width, _): (u32, u32)| width >= 1600;
+    let extended = match args.extend {
+        true => Some(crate::virtual_display::VirtualDisplay::create("Cast Mirror", bounds.0, bounds.1, hidpi(bounds))?),
+        false => None,
+    };
+    let display = match &extended {
+        Some(d) => capture::display_index(d.id)?,
+        None => args.display,
+    };
+    let mut cap = Capture::start(display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
     info!("browser {peer}: screen {bounds:?}, sending {}x{}", cap.width, cap.height);
     let mut bitrate = args.bitrate;
     let mut encoder = VideoEncoder::new(Codec::H264High, cap.width, cap.height, fps, bitrate)?;
@@ -343,9 +377,14 @@ async fn stream(
                     Some(Request::Echo(sent_at)) => rtts.push(now_us().saturating_sub(sent_at)),
                     Some(Request::Resize(width, height)) if (width, height) != bounds => {
                         bounds = (width, height);
+                        if let Some(d) = &extended {
+                            // Same display in a new mode, so the windows on it stay.
+                            d.set_mode(width, height, hidpi(bounds))?;
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        }
                         drop(cap);
                         (cap, encoder) = tokio::task::block_in_place(|| -> Result<_> {
-                            let cap = Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
+                            let cap = Capture::start(display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
                             let mut encoder = VideoEncoder::new(Codec::H264High, cap.width, cap.height, fps, bitrate)?;
                             encoder.set_max_qp(args.max_qp);
                             Ok((cap, encoder))
@@ -453,10 +492,13 @@ async fn stream(
             last_key = Some(Instant::now());
         }
         frame_id = frame_id.wrapping_add(1);
-        let mut message = Vec::with_capacity(encoded.data.len() + 13);
+        let mut message = Vec::with_capacity(encoded.data.len() + HEADER);
         message.push(u8::from(encoded.key_frame));
         message.extend_from_slice(&frame_id.to_be_bytes());
         message.extend_from_slice(&(pts.as_micros() as u64).to_be_bytes());
+        // One piece: the WebSocket takes any size; the data channel task splits it.
+        message.extend_from_slice(&0u16.to_be_bytes());
+        message.extend_from_slice(&1u16.to_be_bytes());
         message.extend_from_slice(&encoded.data);
         let size = message.len();
         let queued = match &channel {
@@ -487,6 +529,12 @@ async fn stream(
     writing.abort();
     drop(cap);
     Ok(next)
+}
+
+/// Changes whenever the page does (FNV-1a of its source).
+fn page_version() -> String {
+    let hash = PAGE.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3));
+    format!("{hash:016x}")
 }
 
 /// The link the receiving device opens (creates the certificate and token on first use).

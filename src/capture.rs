@@ -212,6 +212,19 @@ impl Drop for Capture {
     }
 }
 
+/// The index (as `Capture::start` counts displays) of the display with this CoreGraphics id; a display
+/// created a moment ago takes a little while to show up.
+pub fn display_index(id: u32) -> Result<usize> {
+    for _ in 0..30 {
+        let content = SCShareableContent::get().context("listing displays")?;
+        if let Some(index) = content.displays().iter().position(|d| d.display_id() == id) {
+            return Ok(index);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bail!("the virtual display didn't show up")
+}
+
 /// Menu labels for the displays, in the order `Capture::start` numbers them.
 pub fn display_labels() -> Result<Vec<String>> {
     let content = SCShareableContent::get().context("listing displays")?;

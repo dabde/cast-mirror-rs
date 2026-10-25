@@ -387,6 +387,7 @@ dependencies = [
  "clap",
  "env-libvpx-sys",
  "mdns-sd",
+ "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
  "objc2-core-graphics",

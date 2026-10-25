@@ -50,6 +50,16 @@ const LADDER: [(u32, u32, u32); 4] = [
 
 pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
     capture::ensure_permission()?;
+    // A second monitor instead of a mirror: 1920x1080 at 1x, crisp at TV size. It lives as long as this run.
+    let mut args = args;
+    let _extended = if args.extend {
+        let display = crate::virtual_display::VirtualDisplay::create("Cast Mirror", 1920, 1080, false)?;
+        args.display = capture::display_index(display.id)?;
+        Some(display)
+    } else {
+        None
+    };
+
     let device = args.device.as_deref().context("--direct needs the TV address")?;
     let addr: SocketAddr = device
         .parse()

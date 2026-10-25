@@ -66,7 +66,7 @@
     font-weight: 600;
   }
   .casting #stop { display: block; }
-  .sources { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 4px; }
+  .sources { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 4px; }
   .source {
     display: flex;
     flex-direction: column;
@@ -190,6 +190,7 @@
   <div class="sources">
     <button class="source" id="screen" onclick="castScreen()"><span class="i" style="--i: url(app://localhost/icon/display)"></span>Screen</button>
     <button class="source" id="window" onclick="send({cmd: 'castWindow'})"><span class="i" style="--i: url(app://localhost/icon/macwindow)"></span>Window…</button>
+    <button class="source" id="extend" onclick="send({cmd: 'castExtend'})" title="A second monitor at the receiver's size"><span class="i" style="--i: url(app://localhost/icon/rectangle.on.rectangle)"></span>Extend</button>
   </div>
   <div id="screens"></div>
 
@@ -274,11 +275,12 @@
     document.getElementById("status").textContent = s.status;
     document.getElementById("stats").textContent = s.stats;
     const ready = s.selected !== null;
-    for (const id of ["screen", "window"]) {
+    for (const id of ["screen", "window", "extend"]) {
       document.getElementById(id).disabled = !ready;
     }
     document.getElementById("screen").classList.toggle("active", s.casting && s.source === "screen");
     document.getElementById("window").classList.toggle("active", s.casting && s.source === "window");
+    document.getElementById("extend").classList.toggle("active", s.casting && s.source === "extend");
 
     const screens = document.getElementById("screens");
     screens.replaceChildren(...s.screens.map((name, i) =>

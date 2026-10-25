@@ -75,6 +75,7 @@ enum Cmd {
     Hide,
     CastScreen { index: usize },
     CastWindow,
+    CastExtend,
     Stop,
     Receiver { name: String },
     Profile { index: usize },
@@ -125,6 +126,8 @@ impl Device {
 enum Target {
     Display(usize, String),
     Window(u32, String),
+    // A new virtual display: a second monitor at the receiver's size.
+    Extend,
 }
 
 impl Target {
@@ -132,6 +135,7 @@ impl Target {
         match self {
             Self::Display(_, name) => format!("screen {name}"),
             Self::Window(_, title) => format!("window {}", shorten(title)),
+            Self::Extend => "second screen".into(),
         }
     }
 }
@@ -162,6 +166,7 @@ impl State {
         let source = match &self.target {
             Some(Target::Display(..)) => "screen",
             Some(Target::Window(..)) => "window",
+            Some(Target::Extend) => "extend",
             None => "",
         };
         serde_json::json!({
@@ -368,6 +373,7 @@ pub fn run() -> Result<()> {
                         let name = state.screens.get(index).cloned().unwrap_or_else(|| "1".into());
                         cast(Target::Display(index, name));
                     }
+                    Cmd::CastExtend => cast(Target::Extend),
                     Cmd::CastWindow => {
                         window.set_visible(false);
                         show_window_picker(proxy.clone());
@@ -561,6 +567,7 @@ pub fn run() -> Result<()> {
             match &what {
                 Target::Display(i, _) => args.display = *i,
                 Target::Window(id, _) => args.window = Some(id.to_string()),
+                Target::Extend => args.extend = true,
             }
             let (direct, web) = (device.direct, device.web);
             if web {
