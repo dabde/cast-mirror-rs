@@ -27,19 +27,23 @@
 <canvas id="screen"></canvas>
 <div id="msg">Connecting…</div>
 
-<!-- Receiving, decoding and drawing run in a worker: on the main thread, layout and other page work
-     delayed the decoder's output by up to 140 ms and frames backed up. -->
+<!-- Decoding and drawing run in a worker, away from the main thread's other work. Frames reach it from
+     the main thread, which owns the connections (WebRTC isn't available in workers). -->
 <script id="worker" type="text/plain">
-  // Frames from `cast-mirror web`: flags u8 (bit0 key) | timestamp µs u64 | H.264 Annex B.
-  let canvas, ctx, ws, decoder, url, token;
+  // Frames: flags u8 (bit0 key) | frame u32 | timestamp µs u64 | H.264 Annex B. Over the data channel they
+  // can arrive out of order or not at all (it gives up after 100 ms of retries).
+  const LOST_AFTER_MS = 120;
+  let canvas, ctx, decoder;
   let configured = false;
-  // After skipping, delta frames are useless until the next key frame.
-  let waitingForKey = false;
-  const stats = {decoded: 0, skipped: 0, maxQueue: 0, decodeMs: 0, errors: 0};
-  const queued = new Map();
+  let expected = null;
+  const pending = new Map();
+  let gapSince = 0;
   let shown = false;
+  const stats = {decoded: 0, lost: 0, flushed: 0, maxQueue: 0, decodeMs: 0, errors: 0};
+  const queued = new Map();
 
-  const status = (text) => postMessage({status: text});
+  const up = (text) => postMessage({up: text});
+  const isKey = (buffer) => (new Uint8Array(buffer, 0, 1)[0] & 1) === 1;
 
   // "avc1.PPCCLL" from the SPS (NAL type 7) the key frame starts with.
   function codecOf(data) {
@@ -69,40 +73,42 @@
         stats.decoded++;
         if (!shown) {
           shown = true;
-          status("");
+          postMessage({status: ""});
         }
         frame.close();
       },
-      error(e) {
+      error() {
         stats.errors++;
-        console.warn(e);
-        // A closed decoder can't be reused: start over and ask for a key frame.
+        // A closed decoder can't be reused: start over from the next key frame.
         newDecoder();
-        if (ws && ws.readyState === WebSocket.OPEN) ws.send("k");
+        restart();
       },
     });
   }
 
-  function onFrame(buffer) {
+  // Wait for the next key frame and ask the Mac for one now; nothing buffered so far is of use.
+  function restart() {
+    expected = null;
+    pending.clear();
+    up("k");
+  }
+
+  function decodeOne(buffer) {
     const view = new DataView(buffer);
     const key = (view.getUint8(0) & 1) === 1;
-    const timestamp = Number(view.getBigUint64(1));
-    const data = new Uint8Array(buffer, 9);
+    const timestamp = Number(view.getBigUint64(5));
+    const data = new Uint8Array(buffer, 13);
     if (!configured) {
-      if (!key) return;
       decoder.configure({codec: codecOf(data), optimizeForLatency: true, hardwareAcceleration: "prefer-hardware"});
       configured = true;
     }
-    if (waitingForKey && !key) return;
-    waitingForKey = false;
     stats.maxQueue = Math.max(stats.maxQueue, decoder.decodeQueueSize);
-    // Safari's decoder releases a frame only when the next one comes in, so a backlog never drains: every
-    // hiccup would stay as extra delay. Flush pushes out what it holds; then start over from a key frame.
+    // Safari's decoder releases a frame only when the next one comes in, so a backlog never drains by
+    // itself: flush what it holds and start over from a key frame.
     if (decoder.decodeQueueSize > 3 && !key) {
-      stats.skipped++;
-      waitingForKey = true;
+      stats.flushed++;
       decoder.flush().catch(() => {});
-      ws.send("k");
+      restart();
       return;
     }
     queued.set(timestamp, performance.now());
@@ -110,55 +116,133 @@
     decoder.decode(new EncodedVideoChunk({type: key ? "key" : "delta", timestamp, data}));
   }
 
-  function connect() {
-    ws = new WebSocket(url);
-    ws.binaryType = "arraybuffer";
-    ws.onopen = () => {
-      ws.send(JSON.stringify({token}));
-      status("Waiting for the picture…");
-    };
-    ws.onmessage = (e) => {
-      if (typeof e.data !== "string") {
-        onFrame(e.data);
-      } else if (e.data[0] === "p") {
-        ws.send("e" + e.data.slice(1));
-      }
-    };
-    ws.onclose = () => {
-      status("Disconnected. Retrying…");
-      shown = false;
-      newDecoder();
-      setTimeout(connect, 1000);
-    };
+  // Decodes what is next in line; a frame missing too long is lost, so continue from a later key frame.
+  function drain() {
+    if (expected === null) {
+      const keys = [...pending.keys()].filter((id) => isKey(pending.get(id)));
+      if (!keys.length) return;
+      // The newest key frame: older ones only show the past.
+      expected = Math.max(...keys);
+      for (const id of pending.keys()) if (id < expected) pending.delete(id);
+    }
+    while (expected !== null && pending.has(expected)) {
+      const buffer = pending.get(expected);
+      pending.delete(expected);
+      expected++;
+      gapSince = 0;
+      decodeOne(buffer);
+    }
+    if (expected === null || !pending.size) return;
+    // Waiting for a missing frame while a newer key frame is already here: no reason to wait.
+    const newerKey = [...pending.keys()].some((id) => id > expected && isKey(pending.get(id)));
+    if (newerKey) {
+      stats.lost++;
+      gapSince = 0;
+      expected = null;
+      drain();
+      return;
+    }
+    const now = performance.now();
+    if (!gapSince) {
+      gapSince = now;
+    } else if (now - gapSince > LOST_AFTER_MS) {
+      stats.lost++;
+      gapSince = 0;
+      restart();
+      drain();
+    }
   }
 
+  setInterval(drain, 20);
   setInterval(() => {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send("s" + `decoded ${stats.decoded} fps · skipped ${stats.skipped} · max queue ${stats.maxQueue} · ` +
-        `slowest decode ${stats.decodeMs.toFixed(1)} ms · decoder errors ${stats.errors}`);
-    }
-    Object.assign(stats, {decoded: 0, skipped: 0, maxQueue: 0, decodeMs: 0, errors: 0});
+    up("s" + `decoded ${stats.decoded} fps · lost ${stats.lost} · flushed ${stats.flushed} · max queue ${stats.maxQueue} · ` +
+      `slowest decode ${stats.decodeMs.toFixed(1)} ms · decoder errors ${stats.errors}`);
+    Object.assign(stats, {decoded: 0, lost: 0, flushed: 0, maxQueue: 0, decodeMs: 0, errors: 0});
   }, 1000);
 
   onmessage = (e) => {
-    ({canvas, url, token} = e.data);
-    ctx = canvas.getContext("2d");
-    if (!("VideoDecoder" in self)) {
-      status("This browser has no WebCodecs in workers.\nUse a current Safari, Chrome or Edge.");
-      return;
+    if (e.data.canvas) {
+      canvas = e.data.canvas;
+      ctx = canvas.getContext("2d");
+      newDecoder();
+    } else if (e.data.reset) {
+      // A new connection: frame numbers start over.
+      pending.clear();
+      expected = null;
+      shown = false;
+      newDecoder();
+    } else {
+      const buffer = e.data;
+      const id = new DataView(buffer).getUint32(1);
+      if (expected !== null && id < expected) return; // Late: already past it.
+      pending.set(id, buffer);
+      drain();
     }
-    newDecoder();
-    connect();
   };
 </script>
 
 <script>
   const msg = document.getElementById("msg");
   const token = location.hash.slice(1);
+  let ws = null;
+  let pc = null;
+  let channel = null;
+  let worker = null;
 
   function show(text) {
     msg.textContent = text;
     msg.classList.toggle("hidden", !text);
+  }
+
+  // Up to the Mac: over the data channel once it's open, else the WebSocket.
+  function sendUp(text) {
+    if (channel && channel.readyState === "open") {
+      channel.send(text);
+    } else if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(text);
+    }
+  }
+
+  function onData(data) {
+    if (typeof data === "string") {
+      if (data[0] === "p") {
+        sendUp("e" + data.slice(1));
+      } else if (data[0] === "{") {
+        const message = JSON.parse(data);
+        if (message.answer) pc?.setRemoteDescription({type: "answer", sdp: message.answer});
+      }
+    } else {
+      worker.postMessage(data, [data]);
+    }
+  }
+
+  // Video over UDP: unordered, retried for at most 100 ms, so nothing waits behind a lost piece.
+  async function startWebRtc() {
+    if (!window.RTCPeerConnection) return;
+    pc = new RTCPeerConnection();
+    channel = pc.createDataChannel("video", {ordered: false, maxPacketLifeTime: 100});
+    channel.binaryType = "arraybuffer";
+    channel.onmessage = (e) => onData(e.data);
+    await pc.setLocalDescription(await pc.createOffer());
+    ws.send(JSON.stringify({offer: pc.localDescription.sdp}));
+  }
+
+  function connect() {
+    ws = new WebSocket(`wss://${location.host}/ws`);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      ws.send(JSON.stringify({token}));
+      show("Waiting for the picture…");
+      startWebRtc().catch((e) => console.warn("WebRTC", e));
+    };
+    ws.onmessage = (e) => onData(e.data);
+    ws.onclose = () => {
+      show("Disconnected. Retrying…");
+      pc?.close();
+      pc = channel = null;
+      worker.postMessage({reset: true});
+      setTimeout(connect, 1000);
+    };
   }
 
   // Keep the screen on while watching; the lock is released whenever the page is hidden.
@@ -181,17 +265,21 @@
   });
 
   const canvas = document.getElementById("screen");
-  if (!canvas.transferControlToOffscreen) {
-    show("This browser can't draw from a worker (OffscreenCanvas).\nUse a current Safari, Chrome or Edge.");
+  if (!canvas.transferControlToOffscreen || !("VideoDecoder" in window)) {
+    show("This browser lacks WebCodecs or OffscreenCanvas.\nUse a current Safari, Chrome or Edge.");
   } else if (!token) {
     show("This link is missing its access code.\nOpen the full link the Mac shows.");
   } else {
     const source = document.getElementById("worker").textContent;
-    const worker = new Worker(URL.createObjectURL(new Blob([source], {type: "text/javascript"})));
-    worker.onmessage = (e) => show(e.data.status);
+    worker = new Worker(URL.createObjectURL(new Blob([source], {type: "text/javascript"})));
+    worker.onmessage = (e) => {
+      if (e.data.up) sendUp(e.data.up);
+      if (e.data.status !== undefined) show(e.data.status);
+    };
     const offscreen = canvas.transferControlToOffscreen();
-    worker.postMessage({canvas: offscreen, url: `wss://${location.host}/ws`, token}, [offscreen]);
+    worker.postMessage({canvas: offscreen}, [offscreen]);
     keepAwake();
+    connect();
   }
 </script>
 </body>

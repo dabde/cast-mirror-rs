@@ -1,21 +1,24 @@
 //! `web`: any browser with WebCodecs as receiver (an iPad, a laptop). The Mac serves the page over HTTPS
-//! (self-signed: the browser asks once) and streams H.264 frames over a WebSocket on the same port.
+//! (self-signed: the browser asks once). Video goes over a WebRTC data channel (UDP), the WebSocket on the
+//! same port carries the access check, the connection setup and, until the channel is open, the video too.
 //!
 //! The page link carries a random token in its fragment (never sent in an HTTP request); the page sends it
-//! as its first WebSocket message. Frames go out as binary messages: flags u8 (bit0 key) | timestamp µs u64 |
-//! Annex B. The page sends "k" to ask for a key frame (after a decoder error).
-//!
-//! TCP doesn't drop, it queues: when the writer falls behind, frames are skipped (the next one is a key frame)
-//! and the bitrate comes down, so the picture stays current instead of getting later.
+//! as its first WebSocket message, then a WebRTC offer. Frames: flags u8 (bit0 key) | frame u32 |
+//! timestamp µs u64 | H.264 Annex B. The page opens the channel unordered with at most 100 ms of
+//! retransmissions, so a lost piece costs a retry instead of holding up later frames (TCP did that: round
+//! trips up to 216 ms on Wi-Fi); a frame still missing is given up and the page asks for a key frame ("k").
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use str0m::change::SdpOffer;
+use str0m::net::{Protocol, Receive};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::server::TlsStream;
 use tracing::{info, warn};
@@ -27,7 +30,12 @@ use crate::{Codec, MirrorArgs};
 pub const PORT: u16 = 7443;
 const PAGE: &str = include_str!("web.html");
 const MIN_BITRATE: u32 = 1_000_000;
-// Pings carry µs since this instant; the reader turns the echoes into round-trip times.
+// More than this waiting in the data channel means the link is behind: skip rather than queue. Room for a
+// key frame (up to ~250 KB at 12 Mbit/s) plus a few more, or each key frame would cause the next skip.
+const CHANNEL_BACKLOG: usize = 512 * 1024;
+// Forced key frames at most this often: each one is large, and a skip right after it would ask again.
+const KEY_INTERVAL: Duration = Duration::from_millis(500);
+// Pings carry µs since this instant; echoes turn into round-trip times.
 static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 fn now_us() -> u64 {
@@ -36,11 +44,23 @@ fn now_us() -> u64 {
 
 type Socket = TlsStream<TcpStream>;
 
-/// A browser that sent the right token: the stream to write frames to, and what it asks for.
+/// What the page (over either transport) and the WebRTC task tell the streaming loop.
+enum Request {
+    KeyFrame,
+    Echo(u64),
+    Offer(String),
+    ChannelOpen,
+    // The data channel couldn't take a frame.
+    Skipped,
+    Gone,
+}
+
+/// A browser that sent the right token.
 struct Viewer {
     peer: SocketAddr,
     writer: tokio::io::WriteHalf<Socket>,
-    requests: mpsc::Receiver<u8>,
+    requests: mpsc::Receiver<Request>,
+    requests_tx: mpsc::Sender<Request>,
 }
 
 pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
@@ -66,6 +86,7 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
         }
     });
 
+    let lan: IpAddr = ip.parse().unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let mut stop = control.stop.clone();
     // One viewer at a time: a browser that connects while another watches takes over.
     let mut next: Option<Viewer> = None;
@@ -82,7 +103,7 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
         };
         info!("browser {} connected", viewer.peer);
         (control.status)(format!("Casting to the browser on {}", viewer.peer.ip()));
-        match stream(&args, &control, viewer, &mut viewers).await {
+        match stream(&args, &control, viewer, &mut viewers, lan).await {
             Ok(newcomer) => next = newcomer,
             Err(e) => warn!("browser session: {e:#}"),
         }
@@ -140,38 +161,119 @@ async fn serve(
     if opcode != 1 || hello["token"].as_str() != Some(token) {
         bail!("wrong token");
     }
-    let (requests_tx, requests) = mpsc::channel(8);
+    let (requests_tx, requests) = mpsc::channel(32);
+    let tx = requests_tx.clone();
     tokio::spawn(async move {
-        let (mut rtts, mut since) = (Vec::<u64>::new(), Instant::now());
         while let Ok((opcode, payload)) = read_frame(&mut reader).await {
-            if since.elapsed() >= Duration::from_secs(1) && !rtts.is_empty() {
-                let (min, max) = (rtts.iter().min().unwrap(), rtts.iter().max().unwrap());
-                let avg = rtts.iter().sum::<u64>() / rtts.len() as u64;
-                tracing::info!("browser {peer}: round trip {:.0}/{:.0}/{:.0} ms (min/avg/max)", *min as f64 / 1e3, avg as f64 / 1e3, *max as f64 / 1e3);
-                (rtts, since) = (Vec::new(), Instant::now());
+            if opcode == 8 {
+                break;
             }
-            match opcode {
-                // Echo of a ping: "e" + the µs it was sent at.
-                1 if payload.first() == Some(&b'e') => {
-                    if let Some(sent) = std::str::from_utf8(&payload[1..]).ok().and_then(|s| s.parse::<u64>().ok()) {
-                        rtts.push(now_us().saturating_sub(sent));
-                    }
-                }
-                8 => break,
-                1 if payload.first() == Some(&b'k') => {
-                    let _ = requests_tx.send(b'k').await;
-                }
-                // The page's own numbers, once a second.
-                1 if payload.first() == Some(&b's') => {
-                    tracing::info!("browser {peer}: {}", String::from_utf8_lossy(&payload[1..]));
-                }
-                _ => {}
+            if opcode == 1
+                && let Some(request) = parse_text(&payload, peer)
+            {
+                let _ = tx.send(request).await;
             }
         }
-        let _ = requests_tx.send(b'x').await;
+        let _ = tx.send(Request::Gone).await;
     });
-    viewers.send(Viewer { peer, writer, requests }).await?;
+    viewers.send(Viewer { peer, writer, requests, requests_tx }).await?;
     Ok(())
+}
+
+/// A text message from the page: "k" key frame, "e<µs>" ping echo, "s…" its stats, or {"offer": sdp}.
+fn parse_text(payload: &[u8], peer: SocketAddr) -> Option<Request> {
+    match payload.first()? {
+        b'k' => Some(Request::KeyFrame),
+        b'e' => std::str::from_utf8(&payload[1..]).ok()?.parse().ok().map(Request::Echo),
+        b's' => {
+            info!("browser {peer}: {}", String::from_utf8_lossy(&payload[1..]));
+            None
+        }
+        b'{' => {
+            let message: serde_json::Value = serde_json::from_slice(payload).ok()?;
+            Some(Request::Offer(message["offer"].as_str()?.to_string()))
+        }
+        _ => None,
+    }
+}
+
+/// Answers the page's offer and runs its data channel on a UDP socket; returns the answer SDP and a sender
+/// for frames. As ICE-lite on the LAN address the Mac only answers the browser's connectivity checks.
+async fn webrtc(offer: &str, lan: IpAddr, requests: mpsc::Sender<Request>) -> Result<(String, mpsc::Sender<Vec<u8>>)> {
+    static CRYPTO: std::sync::Once = std::sync::Once::new();
+    CRYPTO.call_once(|| str0m::crypto::from_feature_flags().install_process_default());
+    let socket = UdpSocket::bind((lan, 0)).await?;
+    let local = socket.local_addr()?;
+    // str0m refuses any message beyond 128 KB of buffer by default, and key frames are bigger: each was
+    // skipped, and the page waited for the next key frame. CHANNEL_BACKLOG still caps what may queue.
+    let mut rtc = Rtc::builder()
+        .set_ice_lite(true)
+        .set_sctp_max_buffered_amount(2 * 1024 * 1024)
+        .build(Instant::now());
+    rtc.add_local_candidate(Candidate::host(local, "udp")?);
+    let answer = rtc.sdp_api().accept_offer(SdpOffer::from_sdp_string(offer)?)?;
+    let (frames_tx, mut frames) = mpsc::channel::<Vec<u8>>(2);
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2000];
+        let mut channel = None;
+        loop {
+            let timeout = loop {
+                match rtc.poll_output() {
+                    Ok(Output::Timeout(t)) => break t,
+                    Ok(Output::Transmit(t)) => {
+                        let _ = socket.send_to(&t.contents, t.destination).await;
+                    }
+                    Ok(Output::Event(event)) => match event {
+                        Event::ChannelOpen(id, _) => {
+                            channel = Some(id);
+                            let _ = requests.send(Request::ChannelOpen).await;
+                        }
+                        Event::ChannelData(data) => {
+                            if !data.binary
+                                && let Some(request) = parse_text(&data.data, local)
+                            {
+                                let _ = requests.send(request).await;
+                            }
+                        }
+                        Event::IceConnectionStateChange(IceConnectionState::Disconnected) | Event::ChannelClose(_) => {
+                            return;
+                        }
+                        _ => {}
+                    },
+                    Err(e) => {
+                        warn!("WebRTC: {e}");
+                        return;
+                    }
+                }
+            };
+            let wait = timeout.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
+            let input = tokio::select! {
+                r = socket.recv_from(&mut buf) => {
+                    let Ok((n, source)) = r else { continue };
+                    let Ok(contents) = buf[..n].try_into() else { continue };
+                    Input::Receive(Instant::now(), Receive { proto: Protocol::Udp, source, destination: local, contents })
+                }
+                frame = frames.recv() => {
+                    let Some(frame) = frame else { return };
+                    let Some(mut ch) = channel.and_then(|id| rtc.channel(id)) else { continue };
+                    let (binary, message) = match frame.split_first() {
+                        // Text (pings) is marked by a leading 0xff; video frames start with their flags (0 or 1).
+                        Some((0xff, text)) => (false, text),
+                        _ => (true, &frame[..]),
+                    };
+                    if ch.buffered_amount() > CHANNEL_BACKLOG || !ch.write(binary, message).unwrap_or(false) {
+                        let _ = requests.try_send(Request::Skipped);
+                    }
+                    continue;
+                }
+                _ = tokio::time::sleep(wait) => Input::Timeout(Instant::now()),
+            };
+            if rtc.handle_input(input).is_err() {
+                return;
+            }
+        }
+    });
+    Ok((answer.to_sdp_string(), frames_tx))
 }
 
 /// Streams to one viewer until it leaves, the session stops, or another viewer connects (returned).
@@ -180,29 +282,35 @@ async fn stream(
     control: &Control,
     viewer: Viewer,
     viewers: &mut mpsc::Receiver<Viewer>,
+    lan: IpAddr,
 ) -> Result<Option<Viewer>> {
-    let Viewer { mut writer, mut requests, peer } = viewer;
-    // Writing runs apart from encoding: a full queue means the network is behind, so skip instead of queueing.
-    let (frames_tx, mut frames_rx) = mpsc::channel::<Vec<u8>>(2);
+    let Viewer { mut writer, mut requests, requests_tx, peer } = viewer;
+    // The WebSocket writer runs apart from encoding: a full queue means the link is behind, so skip.
+    let (ws_tx, mut ws_rx) = mpsc::channel::<Vec<u8>>(2);
     let writing = tokio::spawn(async move {
-        while let Some(frame) = frames_rx.recv().await {
+        while let Some(frame) = ws_rx.recv().await {
             if writer.write_all(&frame).await.is_err() {
                 break;
             }
         }
     });
+    // Set once the data channel is open; from then on video goes over UDP.
+    let mut channel: Option<mpsc::Sender<Vec<u8>>> = None;
+    let mut pending_channel: Option<mpsc::Sender<Vec<u8>>> = None;
 
     let fps = args.fps;
     let latest = Arc::new(LatestFrame::default());
     let cap = Capture::start(args.display, args.window.as_deref(), args.width, fps, latest.clone(), None)?;
     let mut bitrate = args.bitrate;
-    let mut encoder = VideoEncoder::new(Codec::H264, cap.width, cap.height, fps, bitrate)?;
+    let mut encoder = VideoEncoder::new(Codec::H264High, cap.width, cap.height, fps, bitrate)?;
     let origin = Instant::now();
-    let (mut need_key, mut last, mut last_pts) = (true, None::<capture::Frame>, Duration::ZERO);
+    let (mut need_key, mut last, mut last_pts, mut frame_id) = (true, None::<capture::Frame>, Duration::ZERO, 0u32);
     let (mut sent, mut dropped, mut bytes, mut largest) = (0u32, 0u32, 0usize, 0usize);
-    let mut ping = tokio::time::interval(Duration::from_millis(200));
+    let mut rtts: Vec<u64> = Vec::new();
     let mut calm_since = Instant::now();
+    let mut last_key = None::<Instant>;
     let mut report = tokio::time::interval(Duration::from_secs(1));
+    let mut ping = tokio::time::interval(Duration::from_millis(200));
     let refresh = Duration::from_secs(1) / fps;
     let mut stop = control.stop.clone();
 
@@ -210,39 +318,76 @@ async fn stream(
         let frame = tokio::select! {
             _ = stop.wait_for(|s| *s) => break None,
             v = viewers.recv() => break v,
-            r = requests.recv() => match r {
-                Some(b'k') => {
-                    need_key = true;
-                    continue;
+            r = requests.recv() => {
+                match r {
+                    Some(Request::KeyFrame) => need_key = true,
+                    Some(Request::Echo(sent_at)) => rtts.push(now_us().saturating_sub(sent_at)),
+                    Some(Request::Offer(sdp)) => match webrtc(&sdp, lan, requests_tx.clone()).await {
+                        Ok((answer, frames)) => {
+                            pending_channel = Some(frames);
+                            let reply = serde_json::json!({"answer": answer}).to_string();
+                            let _ = ws_tx.send(frame_bytes(1, reply.as_bytes())).await;
+                        }
+                        Err(e) => warn!("WebRTC offer from {peer}: {e:#}"),
+                    },
+                    Some(Request::ChannelOpen) => {
+                        info!("browser {peer}: video over the WebRTC data channel (UDP)");
+                        channel = pending_channel.take();
+                        need_key = true;
+                    }
+                    Some(Request::Skipped) => {
+                        dropped += 1;
+                        need_key = true;
+                        calm_since = Instant::now();
+                    }
+                    Some(Request::Gone) | None => {
+                        info!("browser {peer} left");
+                        break None;
+                    }
                 }
-                _ => {
-                    info!("browser {peer} left");
-                    break None;
-                }
-            },
+                continue;
+            }
             _ = ping.tick() => {
-                // Through the same queue as the frames, so it measures what a frame waits too.
-                let _ = frames_tx.try_send(frame_bytes(1, format!("p{}", now_us()).as_bytes()));
+                let text = format!("p{}", now_us());
+                match &channel {
+                    Some(c) => {
+                        let _ = c.try_send([&[0xff], text.as_bytes()].concat());
+                    }
+                    None => {
+                        let _ = ws_tx.try_send(frame_bytes(1, text.as_bytes()));
+                    }
+                }
                 continue;
             }
             _ = report.tick() => {
+                let rtt = if rtts.is_empty() {
+                    String::from("-")
+                } else {
+                    let avg = rtts.iter().sum::<u64>() / rtts.len() as u64;
+                    format!("{}/{}/{} ms", rtts.iter().min().unwrap() / 1000, avg / 1000, rtts.iter().max().unwrap() / 1000)
+                };
                 let line = format!(
-                    "{sent} fps · {:.1} Mbit/s · largest {} KB · target {:.1} · skipped {dropped}",
+                    "{} · {sent} fps · {:.1} Mbit/s · largest {} KB · target {:.1} · skipped {dropped} · round trip {rtt}",
+                    if channel.is_some() { "UDP" } else { "TCP" },
                     bytes as f64 * 8.0 / 1e6,
                     largest / 1024,
                     bitrate as f64 / 1e6
                 );
-                largest = 0;
                 if args.stats {
                     eprintln!("mac: {line}");
                 }
                 (control.stats)(line);
-                // Raise the rate again after a few calm seconds.
-                if dropped == 0 && calm_since.elapsed() > Duration::from_secs(3) && bitrate < args.bitrate {
+                // Lower the rate after skipped frames, raise it again after a few calm seconds.
+                // Single skips come with key frames; several a second mean the link can't keep up.
+                if dropped >= 3 && bitrate > MIN_BITRATE {
+                    bitrate = ((bitrate as f64 * 0.8) as u32).max(MIN_BITRATE);
+                    encoder.set_bitrate(bitrate)?;
+                } else if dropped == 0 && calm_since.elapsed() > Duration::from_secs(3) && bitrate < args.bitrate {
                     bitrate = (bitrate + args.bitrate / 20).min(args.bitrate);
                     encoder.set_bitrate(bitrate)?;
                 }
-                (sent, dropped, bytes) = (0, 0, 0);
+                (sent, dropped, bytes, largest) = (0, 0, 0, 0);
+                rtts.clear();
                 continue;
             }
             _ = latest.ready.notified() => match latest.take_sized(cap.width, cap.height) {
@@ -253,35 +398,46 @@ async fn stream(
         };
         let pts = frame.captured_at.saturating_duration_since(origin).max(last_pts + Duration::from_millis(1));
         last_pts = pts;
-        let force = std::mem::take(&mut need_key);
+        let force = need_key && last_key.is_none_or(|t: Instant| t.elapsed() >= KEY_INTERVAL);
+        need_key &= !force;
         let Some(encoded) = tokio::task::block_in_place(|| encoder.encode(frame.image(), pts, force))? else {
             need_key |= force;
             continue;
         };
         last = Some(frame);
-        let mut message = Vec::with_capacity(encoded.data.len() + 9);
+        if encoded.key_frame {
+            last_key = Some(Instant::now());
+        }
+        frame_id = frame_id.wrapping_add(1);
+        let mut message = Vec::with_capacity(encoded.data.len() + 13);
         message.push(u8::from(encoded.key_frame));
+        message.extend_from_slice(&frame_id.to_be_bytes());
         message.extend_from_slice(&(pts.as_micros() as u64).to_be_bytes());
         message.extend_from_slice(&encoded.data);
         let size = message.len();
-        match frames_tx.try_send(frame_bytes(2, &message)) {
+        let queued = match &channel {
+            Some(c) => c.try_send(message).map_err(|e| matches!(e, mpsc::error::TrySendError::Closed(_))),
+            None => ws_tx.try_send(frame_bytes(2, &message)).map_err(|e| matches!(e, mpsc::error::TrySendError::Closed(_))),
+        };
+        match queued {
             Ok(()) => {
                 sent += 1;
                 bytes += size;
                 largest = largest.max(size);
             }
-            // The decoder can't use later delta frames without this one: restart from a key frame, slower.
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            // The data channel closed: back to the WebSocket.
+            Err(true) if channel.is_some() => {
+                warn!("browser {peer}: data channel closed, back to the WebSocket");
+                channel = None;
+                need_key = true;
+            }
+            Err(true) => break None,
+            // Behind: the decoder can't use later delta frames without this one, so restart from a key frame.
+            Err(false) => {
                 dropped += 1;
                 need_key = true;
                 calm_since = Instant::now();
-                let lower = (bitrate as f64 * 0.8) as u32;
-                if lower >= MIN_BITRATE && lower < bitrate {
-                    bitrate = lower;
-                    encoder.set_bitrate(bitrate)?;
-                }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => break None,
         }
     };
     writing.abort();

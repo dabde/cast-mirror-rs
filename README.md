@@ -54,13 +54,20 @@ Grant the permission once more after the first signed build; later builds keep i
 
 ## Browser receiver
 
-`cast-mirror web` serves a receiver page any browser with WebCodecs can open (an iPad, a laptop): it prints a link
-`https://<this Mac>:7443/#<token>`. The certificate is self-signed (the browser asks once); the token in the link
-is the access check. The page decodes H.264 in a worker (WebCodecs, hardware) and draws to a canvas.
+`cast-mirror web --fps 60 --bitrate 10M` serves a receiver page any browser with WebCodecs can open (an iPad, a
+laptop): it prints a link `https://<this Mac>:7443/#<token>`. The certificate is self-signed (the browser asks
+once); the token in the link is the access check.
 
-Over a WebSocket (TCP) it stutters on Wi-Fi: on an iPad Pro 11" the round trip jumps to 100-216 ms even at
-0.2 Mbit/s (UDP to the TV app: 6-16 ms), and Safari's decoder releases a frame only when the next one comes in,
-so every TCP burst adds delay that has to be flushed. 30 fps works better than 60; a UDP path is next.
+Video goes over a WebRTC data channel (UDP, via str0m on the Mac as ICE-lite peer), opened unordered with at most
+100 ms of retransmissions, so a lost piece costs one retry instead of holding up later frames. The page decodes
+H.264 High in a worker (WebCodecs, hardware) and draws to a canvas; frames carry a number so it can put them back
+in order, and a frame still missing after 120 ms (or once a newer key frame is there) is given up for a key frame.
+
+Measured on an iPad Pro 11" (2018) over Wi-Fi: 50-80 ms glass to glass, 57 fps on average at 60 fps, round trip
+4-18 ms. The first version used the WebSocket (TCP) for video: round trips up to 216 ms, and every burst piled up
+in Safari's decoder, which releases a frame only when the next one comes in. Two things mattered on the way:
+str0m's default 128 KB send buffer rejected every larger frame (key frames reach 230 KB), and at 6 Mbit/s busy
+pictures look blocky, so 10 Mbit/s is the sensible rate here.
 
 ## Layout
 
