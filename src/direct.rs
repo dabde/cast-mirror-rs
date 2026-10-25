@@ -4,7 +4,8 @@
 //!   seq u32 | send ms u32 | counter u64 | AES-128-GCM(payload) with a 16-byte tag over everything before it.
 //! From the app, as counter u64 | AES-128-GCM(message): 'K' key frame request; 'N' frame u32, n u16,
 //!   n x index u16 (missing packets; n = 0xffff: the whole frame); 'R' every 100 ms: received u32,
-//!   expected u32, minimum one-way delay ms i32, frames given up u32.
+//!   expected u32, minimum one-way delay ms i32, frames given up u32, average first-packet-to-complete µs u32,
+//!   average decoder µs u32; 'E' echoes a ping. Ping: "CP" | 3 | 0 | counter | sealed send time µs u64.
 //! The nonce is direction (0: to the app, 1: from it) | 0 0 0 | counter. A fresh random key per session
 //! reaches the app over ADB, which the TV authenticated when it accepted this Mac.
 
@@ -33,6 +34,10 @@ const PAYLOAD: usize = 1376;
 const HISTORY: usize = 120;
 const MIN_BITRATE: u32 = 400_000;
 const KEY_INTERVAL: Duration = Duration::from_millis(500);
+// Wi-Fi round trips: the app echoes each ping at once.
+const PING_INTERVAL: Duration = Duration::from_millis(100);
+// A ping is "CP" | version | 0, then the send time in µs u64.
+const PING: usize = 4;
 
 /// Auto ladder, best first: (max width, fps, bitrate needed to stay on this rung). Sized for HEVC,
 /// which direct mode uses; H.264 needs roughly 40 % more for the same picture.
@@ -93,6 +98,7 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
     let mut last_key = None::<Instant>;
     let mut stats = Stats::default();
     let mut report = tokio::time::interval(Duration::from_secs(1));
+    let mut ping = tokio::time::interval(PING_INTERVAL);
     let mut feedback = [0u8; 2048];
     let mut stop = control.stop.clone();
     let stopped = async move {
@@ -137,9 +143,18 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
                         }
                         stats.nacks += 1;
                     }
+                    [b'E', ..] if n >= 9 => {
+                        let sent = u64::from_be_bytes(msg[1..9].try_into().unwrap());
+                        stats.rtt_us.push((origin.elapsed().as_micros() as u64).saturating_sub(sent));
+                    }
                     [b'R', ..] if n >= 17 => {
                         let field = |o: usize| u32::from_be_bytes(msg[o..o + 4].try_into().unwrap());
                         let fb = Report { received: field(1), expected: field(5), owd_ms: field(9) as i32, given_up: field(13) };
+                        // Older app versions send 17 bytes; 0 means no frame in that report.
+                        if n >= 25 {
+                            stats.transfer_us.extend([field(17)].into_iter().filter(|&us| us > 0).map(u64::from));
+                            stats.decode_us.extend([field(21)].into_iter().filter(|&us| us > 0).map(u64::from));
+                        }
                         stats.loss = fb.loss();
                         let now = Instant::now();
                         let changed = rate.on_report(now, &fb).is_some();
@@ -175,10 +190,17 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
                 }
                 continue;
             }
+            _ = ping.tick() => {
+                let mut p = vec![b'C', b'P', 3, 0];
+                p.extend_from_slice(&(origin.elapsed().as_micros() as u64).to_be_bytes());
+                link.send_with(&p, PING).await;
+                continue;
+            }
             _ = report.tick() => {
                 if args.stats {
                     stats.print(rate.bitrate, args.auto.then_some(ladder.rung));
                 }
+                (control.stats)(stats.summary());
                 stats = Stats { queue_ms: rate.queue_ms, loss: stats.loss, ..Stats::default() };
                 continue;
             }
@@ -271,9 +293,14 @@ impl Link {
         Self { socket, crypto, drop: env("CAST_MIRROR_DROP"), paced, rng: 0x9e37_79b9_7f4a_7c15 }
     }
 
-    /// Encrypts on every send, resends included: their flags differ, so they need a fresh nonce.
     async fn send(&mut self, packet: &[u8]) {
-        let packet = &wire(self.crypto.as_mut(), packet)[..];
+        self.send_with(packet, HEADER).await;
+    }
+
+    /// Encrypts on every send, resends included: their flags differ, so they need a fresh nonce.
+    /// `clear`: the readable prefix (HEADER for video, PING for pings).
+    async fn send_with(&mut self, packet: &[u8], clear: usize) {
+        let packet = &wire(self.crypto.as_mut(), packet, clear)[..];
         if self.drop > 0.0 {
             // xorshift: cheap and good enough for a loss simulation.
             self.rng ^= self.rng << 13;
@@ -295,9 +322,9 @@ impl Link {
 }
 
 /// What goes on the wire: sealed (v3), or with `--no-encryption` the packet as it is, marked v2.
-fn wire(crypto: Option<&mut Crypto>, packet: &[u8]) -> Vec<u8> {
+fn wire(crypto: Option<&mut Crypto>, packet: &[u8], clear: usize) -> Vec<u8> {
     match crypto {
-        Some(crypto) => crypto.seal(packet, HEADER, TO_APP),
+        Some(crypto) => crypto.seal(packet, clear, TO_APP),
         None => {
             let mut plain = packet.to_vec();
             plain[2] = 2;
@@ -539,13 +566,46 @@ struct Stats {
     retransmits: u32,
     loss: f64,
     queue_ms: i32,
+    // Measured this second: ping round trips, and the app's first-packet-to-complete and decoder times.
+    rtt_us: Vec<u64>,
+    transfer_us: Vec<u64>,
+    decode_us: Vec<u64>,
 }
 
 impl Stats {
+    fn ms(samples: &[u64]) -> Option<f64> {
+        (!samples.is_empty()).then(|| samples.iter().sum::<u64>() as f64 / samples.len() as f64 / 1000.0)
+    }
+
+    /// One line for the menu bar window, e.g. "Wi-Fi RTT 4 ms (3–9) · transfer 6 ms · decoder 11 ms · loss 0.3 %".
+    fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(avg) = Self::ms(&self.rtt_us) {
+            let min = *self.rtt_us.iter().min().unwrap() as f64 / 1000.0;
+            let max = *self.rtt_us.iter().max().unwrap() as f64 / 1000.0;
+            parts.push(format!("Wi-Fi RTT {avg:.0} ms ({min:.0}–{max:.0})"));
+        }
+        if let Some(t) = Self::ms(&self.transfer_us) {
+            parts.push(format!("transfer {t:.0} ms"));
+        }
+        if let Some(d) = Self::ms(&self.decode_us) {
+            parts.push(format!("decoder {d:.0} ms"));
+        }
+        parts.push(format!("loss {:.1} %", self.loss * 100.0));
+        parts.join(" · ")
+    }
+
     fn print(&self, target: u32, rung: Option<usize>) {
         let rung = rung.map_or(String::new(), |r| format!("  rung {r}"));
+        let ms = |s: &[u64]| Self::ms(s).map_or("-".into(), |v| format!("{v:.1}"));
+        let timing = format!(
+            "  rtt {} ms  xfer {} ms  dec {} ms",
+            ms(&self.rtt_us),
+            ms(&self.transfer_us),
+            ms(&self.decode_us)
+        );
         eprintln!(
-            "fps {:>3}  sent {:>6} kbit/s  target {:>5} kbit/s  loss {:>4.1}%  queue {:>3} ms  nacks {:>3}  retx {:>4}  keys {}{rung}",
+            "fps {:>3}  sent {:>6} kbit/s  target {:>5} kbit/s  loss {:>4.1}%  queue {:>3} ms  nacks {:>3}  retx {:>4}  keys {}{timing}{rung}",
             self.frames,
             self.bytes * 8 / 1000,
             target / 1000,
@@ -576,10 +636,17 @@ mod tests {
     #[test]
     fn unencrypted_packets_go_out_unchanged_as_v2() {
         let packet = packetize(1, 0, &mut 0, 0, &[5u8; 10]).remove(0);
-        let plain = wire(None, &packet);
+        let plain = wire(None, &packet, HEADER);
         assert_eq!(plain[2], 2);
         assert_eq!(plain[3..], packet[3..]);
-        assert_eq!(wire(Some(&mut Crypto::new(&[1; 16])), &packet)[2], 3);
+        assert_eq!(wire(Some(&mut Crypto::new(&[1; 16])), &packet, HEADER)[2], 3);
+    }
+
+    #[test]
+    fn summary_reports_round_trip_spread_and_app_timings() {
+        let stats = Stats { rtt_us: vec![3_000, 4_000, 9_000], transfer_us: vec![6_000], decode_us: vec![11_000], loss: 0.003, ..Stats::default() };
+        assert_eq!(stats.summary(), "Wi-Fi RTT 5 ms (3–9) · transfer 6 ms · decoder 11 ms · loss 0.3 %");
+        assert_eq!(Stats::default().summary(), "loss 0.0 %");
     }
 
     #[test]

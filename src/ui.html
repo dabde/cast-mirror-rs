@@ -158,6 +158,7 @@
     <div class="text">
       <div class="title">Cast Mirror</div>
       <div class="status" id="status"></div>
+      <div class="status" id="stats"></div>
     </div>
     <button id="stop" onclick="send({cmd: 'stop'})">Stop</button>
   </header>
@@ -228,6 +229,7 @@
     state = s;
     document.body.classList.toggle("casting", s.casting);
     document.getElementById("status").textContent = s.status;
+    document.getElementById("stats").textContent = s.stats;
     const ready = s.selected !== null;
     for (const id of ["screen", "window"]) {
       document.getElementById(id).disabled = !ready;

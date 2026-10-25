@@ -141,6 +141,11 @@ The TV's video plane runs its picture processing (~85 ms); `--ez texture false` 
 Declaring the app a game (`GAME=1 ./build.sh`) makes no difference on this Philips. The decoder rejects
 Android's KEY_LOW_LATENCY but accepts MediaTek's `vdec-lowlatency`.
 
+**Per stage** (`--stats` and the menu bar window show these live): the sender pings the app every 100 ms, and
+the app reports how long a frame takes from its first packet to complete (transfer) and through the decoder.
+Measured at 60 fps over Wi-Fi: round trip 6-16 ms (so ~3-8 ms one way), transfer 0-7 ms depending on frame
+size, decoder 23 ms.
+
 **Encryption (protocol v3):** every packet in both directions is AES-128-GCM sealed: payload encrypted,
 header authenticated, a counter per packet as nonce, so resends get fresh nonces. The key is random per session
 and reaches the app with the start intent over ADB, which the TV authenticated when it accepted this Mac; that is

@@ -51,6 +51,8 @@ enum End {
 pub struct Control {
     pub stop: watch::Receiver<bool>,
     pub status: Arc<dyn Fn(String) + Send + Sync>,
+    /// Live measurements, once a second.
+    pub stats: Arc<dyn Fn(String) + Send + Sync>,
 }
 
 impl Control {
@@ -61,7 +63,7 @@ impl Control {
             let _ = tokio::signal::ctrl_c().await;
             let _ = tx.send(true);
         });
-        Self { stop, status: Arc::new(|_| {}) }
+        Self { stop, status: Arc::new(|_| {}), stats: Arc::new(|_| {}) }
     }
 
     async fn stopped(&self) {
@@ -280,6 +282,9 @@ async fn session(
                         }
                         if args.stats {
                             pipeline.stats.print(v, pipeline.rate.bitrate);
+                        }
+                        if let Some(rtt) = v.current_rtt {
+                            (control.stats)(format!("Cast RTT {} ms", rtt.as_millis()));
                         }
                     }
                 }

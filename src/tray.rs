@@ -52,6 +52,7 @@ enum Ui {
     Js(String),
     Devices(Vec<Found>),
     Status(String),
+    Stats(String),
     Stopped(Option<String>),
     // Picked in the macOS window picker: id and "app: title".
     Window(u32, String),
@@ -110,6 +111,8 @@ impl Target {
 /// Everything the window shows; `view()` hands it to `render()` in ui.html.
 struct State {
     status: String,
+    // Live measurements while casting.
+    stats: String,
     devices: Vec<Device>,
     selected: Option<String>,
     screens: Vec<String>,
@@ -130,6 +133,7 @@ impl State {
         };
         serde_json::json!({
             "status": self.status,
+            "stats": self.stats,
             "casting": casting,
             "source": source,
             "receivers": self.devices.iter().map(|d| serde_json::json!({"name": d.name, "direct": d.direct})).collect::<Vec<_>>(),
@@ -192,6 +196,7 @@ pub fn run() -> Result<()> {
 
     let mut state = State {
         status: "Looking for receivers…".into(),
+        stats: String::new(),
         devices: Vec::new(),
         selected: None,
         screens: Vec::new(),
@@ -351,6 +356,10 @@ pub fn run() -> Result<()> {
                 state.status = text;
                 changed = true;
             }
+            Event::UserEvent(Ui::Stats(text)) => {
+                state.stats = text;
+                changed = true;
+            }
             Event::UserEvent(Ui::Window(id, title)) => {
                 tracing::info!("cast window {title}");
                 state.target = Some(Target::Window(id, title));
@@ -364,6 +373,7 @@ pub fn run() -> Result<()> {
             Event::UserEvent(Ui::Stopped(error)) => {
                 stop = None;
                 state.status = error.unwrap_or_else(|| "Stopped".into());
+                state.stats.clear();
                 if let Some(t) = &tray {
                     let _ = t.set_icon_templated(Some(icon(false)));
                 }
@@ -412,10 +422,14 @@ pub fn run() -> Result<()> {
             let (tx, rx) = watch::channel(false);
             let status_proxy = proxy.clone();
             let label = what.label();
+            let stats_proxy = proxy.clone();
             let control = Control {
                 stop: rx,
                 status: Arc::new(move |s| {
                     let _ = status_proxy.send_event(Ui::Status(format!("{s} · {label}")));
+                }),
+                stats: Arc::new(move |s| {
+                    let _ = stats_proxy.send_event(Ui::Stats(s));
                 }),
             };
             let done = proxy.clone();

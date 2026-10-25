@@ -43,7 +43,9 @@ import java.util.TreeMap;
  *   seq u32 | send ms u32 | counter u64 | AES-128-GCM(payload), the tag covering everything before it.
  * Back to the sender, as counter u64 | AES-128-GCM(message): 'K' key frame request; 'N' frame u32, n u16,
  *   n x index u16 (missing packets; n = 0xffff: the whole frame); 'R' every 100 ms: received u32,
- *   expected u32, minimum one-way delay ms i32, frames given up u32.
+ *   expected u32, minimum one-way delay ms i32, frames given up u32, average first-packet-to-complete µs u32,
+ *   average decoder µs u32; 'E' echoes a ping: timestamp u64.
+ * Ping from the sender: "CP" | version | 0 | (counter |) timestamp u64, sealed like a packet.
  * Nonce: direction (0 to the app, 1 from it) | 0 0 0 | counter. The key comes with the start intent.
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback, TextureView.SurfaceTextureListener {
@@ -51,6 +53,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     static final int HEADER = 20;
     static final int COUNTER = 8;
     static final int GCM_TAG = 16;
+    // "CP" | version | 0, then the sender's timestamp u64.
+    static final int PING = 4;
     static final byte TO_APP = 0;
     static final byte FROM_APP = 1;
     static final String TAG = "CastMirror";
@@ -181,20 +185,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
         }
     }
 
-    // Decrypts a v3 packet in place (payload lands at HEADER); returns its length, or -1 if it doesn't
-    // authenticate: not from our sender, or altered on the way.
-    private int open(byte[] buf, int n) {
-        if (n < HEADER + COUNTER + GCM_TAG) {
+    // Decrypts a v3 message in place (payload lands at `clear`, after the readable prefix); returns its
+    // length, or -1 if it doesn't authenticate: not from our sender, or altered on the way.
+    private int open(byte[] buf, int n, int clear) {
+        if (n < clear + COUNTER + GCM_TAG) {
             return -1;
         }
         try {
-            long counter = ByteBuffer.wrap(buf, HEADER, COUNTER).getLong();
+            long counter = ByteBuffer.wrap(buf, clear, COUNTER).getLong();
             opener.init(Cipher.DECRYPT_MODE, key, new GCMParameterSpec(128, nonce(TO_APP, counter)));
-            opener.updateAAD(buf, 0, HEADER + COUNTER);
-            return opener.doFinal(buf, HEADER + COUNTER, n - HEADER - COUNTER, buf, HEADER);
+            opener.updateAAD(buf, 0, clear + COUNTER);
+            return opener.doFinal(buf, clear + COUNTER, n - clear - COUNTER, buf, clear);
         } catch (GeneralSecurityException e) {
             return -1;
         }
+    }
+
+    // Payload length of a v2 (plain) or v3 (sealed) message with a `clear`-byte readable prefix, or -1.
+    private int payload(byte[] buf, int n, int clear) {
+        if (buf[2] == 3 && key != null) {
+            return open(buf, n, clear);
+        }
+        return buf[2] == 2 && plain && n >= clear ? n - clear : -1;
     }
 
     private void receive(Surface surface) {
@@ -248,11 +260,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                         && now - lastPacket < 300;
                 int payload = -1;
                 if (got && !foreign && n >= HEADER && buf[0] == 'C' && buf[1] == 'M') {
-                    if (buf[2] == 3 && key != null) {
-                        payload = open(buf, n);
-                    } else if (buf[2] == 2 && plain) {
-                        payload = n - HEADER;
-                    }
+                    payload = payload(buf, n, HEADER);
+                } else if (got && !foreign && n >= PING && buf[0] == 'C' && buf[1] == 'P'
+                        && payload(buf, n, PING) == 8 && sender != null) {
+                    // Wi-Fi round trip: echo the sender's timestamp at once.
+                    byte[] echo = new byte[9];
+                    echo[0] = 'E';
+                    System.arraycopy(buf, PING, echo, 1, 8);
+                    send(socket, echo, 9, sender);
                 }
                 if (payload >= 0) {
                     n = HEADER + payload;
@@ -398,10 +413,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                     lastAsk = now;
                 }
                 if (now - lastReport >= 100 && seqHigh >= 0) {
-                    ByteBuffer report = ByteBuffer.allocate(17);
+                    ByteBuffer report = ByteBuffer.allocate(25);
                     report.put((byte) 'R').putInt(received).putInt((int) (seqHigh - seqAtReport));
                     report.putInt(received > 0 ? (int) owdMin : 0).putInt(unrecovered);
-                    send(socket, report.array(), 17, sender);
+                    report.putInt(transfer.takeAverage()).putInt(decoding.takeAverage());
+                    send(socket, report.array(), 25, sender);
                     lastReport = now;
                     seqAtReport = seqHigh;
                     received = 0;
@@ -438,6 +454,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
             ByteBuffer input = codec.getInputBuffer(in);
             input.clear();
             frame.copyTo(input);
+            transfer.add(frame.completeUs - frame.firstUs);
+            // Queue time as the timestamp: drain() reads it back to time the decoder.
             codec.queueInputBuffer(in, 0, input.position(), System.nanoTime() / 1000, 0);
             if (label.getVisibility() == TextView.VISIBLE) {
                 runOnUiThread(() -> label.setVisibility(TextView.GONE));
@@ -512,12 +530,35 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     }
 
     /** Renders every decoded frame immediately. */
-    private static void drain(MediaCodec codec, MediaCodec.BufferInfo info) {
+    private void drain(MediaCodec codec, MediaCodec.BufferInfo info) {
         int out;
         while ((out = codec.dequeueOutputBuffer(info, 0)) >= 0) {
+            decoding.add(System.nanoTime() / 1000 - info.presentationTimeUs);
             codec.releaseOutputBuffer(out, true);
         }
     }
+
+    /** Microsecond samples averaged per report; the receive loop polls every 2 ms, so ±2 ms. */
+    static final class Average {
+        long sum;
+        int count;
+
+        void add(long us) {
+            sum += us;
+            count++;
+        }
+
+        int takeAverage() {
+            int avg = count == 0 ? 0 : (int) (sum / count);
+            sum = 0;
+            count = 0;
+            return avg;
+        }
+    }
+
+    // First packet to complete frame (Wi-Fi transfer), and decoder queue to output.
+    private final Average transfer = new Average();
+    private final Average decoding = new Average();
 
     private static String localAddress() {
         try {
@@ -543,6 +584,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
         int maxIndex;
         int nacks;
         long lastNack;
+        final long firstUs = System.nanoTime() / 1000;
+        long completeUs;
 
         Frame(long id, int count, int flags, long arrived) {
             this.id = id;
@@ -560,6 +603,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                 received++;
                 maxIndex = Math.max(maxIndex, index);
                 lastProgress = SystemClock.elapsedRealtime();
+                if (received == parts.length) {
+                    completeUs = System.nanoTime() / 1000;
+                }
             }
         }
 
