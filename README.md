@@ -144,7 +144,10 @@ Android's KEY_LOW_LATENCY but accepts MediaTek's `vdec-lowlatency`.
 **Per stage** (`--stats` and the menu bar window show these live): the sender pings the app every 100 ms, and
 the app reports how long a frame takes from its first packet to complete (transfer) and through the decoder.
 Measured at 60 fps over Wi-Fi: round trip 6-16 ms (so ~3-8 ms one way), transfer 0-7 ms depending on frame
-size, decoder 23 ms.
+size, decoder 23 ms. The decoder number was one frame interval plus ~6 ms (39.5 ms at 30 fps): the MediaTek
+decoder holds each frame until the next one starts. The app now appends an access unit delimiter to every
+frame, which marks that boundary at once: decoder 6 ms at 30 and 60 fps, so ~17 ms less end to end at 60 fps
+and ~33 ms at 30 fps (from the per-stage numbers; not re-measured with the lag wheel yet).
 
 **Encryption (protocol v3):** every packet in both directions is AES-128-GCM sealed: payload encrypted,
 header authenticated, a counter per packet as nonce, so resends get fresh nonces. The key is random per session

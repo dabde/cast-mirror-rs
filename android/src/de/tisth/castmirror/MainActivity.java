@@ -53,6 +53,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     static final int HEADER = 20;
     static final int COUNTER = 8;
     static final int GCM_TAG = 16;
+    static final byte[] AUD_HEVC = {0, 0, 0, 1, 0x46, 0x01, 0x50};
+    static final byte[] AUD_H264 = {0, 0, 0, 1, 0x09, (byte) 0xf0};
     // "CP" | version | 0, then the sender's timestamp u64.
     static final int PING = 4;
     static final byte TO_APP = 0;
@@ -454,6 +456,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
             ByteBuffer input = codec.getInputBuffer(in);
             input.clear();
             frame.copyTo(input);
+            // The decoder holds a frame until it sees where the next one starts (a full frame interval at
+            // 30 or 60 fps); an access unit delimiter right after the frame marks that boundary at once.
+            input.put(hevc ? AUD_HEVC : AUD_H264);
             transfer.add(frame.completeUs - frame.firstUs);
             // Queue time as the timestamp: drain() reads it back to time the decoder.
             codec.queueInputBuffer(in, 0, input.position(), System.nanoTime() / 1000, 0);
