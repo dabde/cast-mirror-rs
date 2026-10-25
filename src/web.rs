@@ -203,7 +203,12 @@ fn parse_text(payload: &[u8], peer: SocketAddr) -> Option<Request> {
 
 /// Answers the page's offer and runs its data channel on a UDP socket; returns the answer SDP and a sender
 /// for frames. As ICE-lite on the LAN address the Mac only answers the browser's connectivity checks.
-async fn webrtc(offer: &str, lan: IpAddr, requests: mpsc::Sender<Request>) -> Result<(String, mpsc::Sender<Vec<u8>>)> {
+async fn webrtc(
+    offer: &str,
+    lan: IpAddr,
+    peer: SocketAddr,
+    requests: mpsc::Sender<Request>,
+) -> Result<(String, mpsc::Sender<Vec<u8>>)> {
     static CRYPTO: std::sync::Once = std::sync::Once::new();
     CRYPTO.call_once(|| str0m::crypto::from_feature_flags().install_process_default());
     let socket = UdpSocket::bind((lan, 0)).await?;
@@ -235,7 +240,7 @@ async fn webrtc(offer: &str, lan: IpAddr, requests: mpsc::Sender<Request>) -> Re
                         }
                         Event::ChannelData(data) => {
                             if !data.binary
-                                && let Some(request) = parse_text(&data.data, local)
+                                && let Some(request) = parse_text(&data.data, peer)
                             {
                                 let _ = requests.send(request).await;
                             }
@@ -310,6 +315,7 @@ async fn stream(
     info!("browser {peer}: screen {bounds:?}, sending {}x{}", cap.width, cap.height);
     let mut bitrate = args.bitrate;
     let mut encoder = VideoEncoder::new(Codec::H264High, cap.width, cap.height, fps, bitrate)?;
+    encoder.set_max_qp(args.max_qp);
     let origin = Instant::now();
     let (mut need_key, mut last, mut last_pts, mut frame_id) = (true, None::<capture::Frame>, Duration::ZERO, 0u32);
     let (mut sent, mut dropped, mut bytes, mut largest) = (0u32, 0u32, 0usize, 0usize);
@@ -329,7 +335,7 @@ async fn stream(
                 match r {
                     Some(Request::KeyFrame) => need_key = true,
                     Some(Request::Echo(sent_at)) => rtts.push(now_us().saturating_sub(sent_at)),
-                    Some(Request::Offer(sdp)) => match webrtc(&sdp, lan, requests_tx.clone()).await {
+                    Some(Request::Offer(sdp)) => match webrtc(&sdp, lan, peer, requests_tx.clone()).await {
                         Ok((answer, frames)) => {
                             pending_channel = Some(frames);
                             let reply = serde_json::json!({"answer": answer}).to_string();

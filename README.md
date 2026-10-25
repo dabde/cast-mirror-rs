@@ -70,6 +70,11 @@ in Safari's decoder, which releases a frame only when the next one comes in. Two
 str0m's default 128 KB send buffer rejected every larger frame (key frames reach 230 KB), and at 6 Mbit/s busy
 pictures look blocky. At native resolution 20 Mbit/s works (57 fps, round trip 11-18 ms at full rate; the
 network carried 30 Mbit/s too); key frames then reach 400 KB and still cause about four short hitches a minute.
+The page draws the picture pixel for pixel (a 3 % stretch to the view blurred every edge). Text still looks soft,
+also when zooming in: the Mac scales its 3456 pixels down to ~2300, and that detail is gone before encoding
+(`--max-qp 24` doesn't change it). Sending more pixels failed: 4112x2658 is beyond H.264 (VideoToolbox refuses),
+3564x2304 is beyond the iPad's hardware decoder (Safari fell back to software, under 1 fps), and 3340x2160 came
+out of the encoder at 2 fps. Casting a single window (`--window`) at most the iPad's size avoids the downscale.
 
 ## Layout
 
