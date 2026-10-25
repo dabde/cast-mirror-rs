@@ -20,10 +20,25 @@ unsafe extern "C" {
     fn CGDisplayIsBuiltin(display: u32) -> u32;
 }
 
+unsafe extern "C" {
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+}
+
+/// Now on the host clock, which ScreenCaptureKit stamps its frames with.
+fn host_seconds() -> f64 {
+    let mut timebase = [0u32; 2];
+    unsafe { mach_timebase_info(&mut timebase) };
+    let ticks = unsafe { mach_absolute_time() };
+    ticks as f64 * timebase[0] as f64 / timebase[1] as f64 / 1e9
+}
+
 #[derive(Clone)]
 pub struct Frame {
     image: CFRetained<CVPixelBuffer>,
     pub captured_at: Instant,
+    /// How old the frame already was when ScreenCaptureKit handed it over.
+    pub capture_age: Option<std::time::Duration>,
 }
 
 // CVPixelBuffers are thread-safe reference-counted objects.
@@ -35,7 +50,9 @@ impl Frame {
         // The bridge returns the image buffer +1 retained; adopt it, or every call pins a
         // capture surface and SCK stops after queueDepth frames.
         let raw = NonNull::new(sample.image_buffer_ptr() as *mut CVPixelBuffer)?;
-        Some(Self { image: unsafe { CFRetained::from_raw(raw) }, captured_at: Instant::now() })
+        let age = sample.presentation_timestamp().as_seconds().map(|pts| host_seconds() - pts);
+        let capture_age = age.filter(|a| (0.0..1.0).contains(a)).map(std::time::Duration::from_secs_f64);
+        Some(Self { image: unsafe { CFRetained::from_raw(raw) }, captured_at: Instant::now(), capture_age })
     }
 
     pub fn image(&self) -> &CVImageBuffer {

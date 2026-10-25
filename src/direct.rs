@@ -205,16 +205,25 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
                 continue;
             }
             _ = latest.ready.notified() => match latest.take_sized(cap.width, cap.height) {
-                Some(f) => f,
+                Some(f) => (f, true),
                 None => continue,
             },
-            _ = tokio::time::sleep(refresh), if last.is_some() => last.clone().unwrap(),
+            _ = tokio::time::sleep(refresh), if last.is_some() => (last.clone().unwrap(), false),
         };
+        // Refreshed frames (static screen) are not new: they don't count for the Mac-side timings.
+        let (frame, fresh) = frame;
+        let handed_over = frame.captured_at;
         // Refreshed frames reuse the capture time; VideoToolbox needs increasing timestamps.
         let pts = frame.captured_at.saturating_duration_since(origin).max(last_pts + Duration::from_millis(1));
         last_pts = pts;
         let force = std::mem::take(&mut need_key);
-        let Some(encoded) = tokio::task::block_in_place(|| encoder.encode(frame.image(), pts, force))? else {
+        let encode_start = Instant::now();
+        let encoded = tokio::task::block_in_place(|| encoder.encode(frame.image(), pts, force))?;
+        if fresh {
+            stats.encode_us.push(encode_start.elapsed().as_micros() as u64);
+            stats.capture_us.extend(frame.capture_age.map(|a| a.as_micros() as u64));
+        }
+        let Some(encoded) = encoded else {
             need_key |= force;
             continue;
         };
@@ -225,6 +234,9 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
         let packets = packetize(id, flags, &mut seq, sent_ms, &encoded.data);
         for p in &packets {
             link.send(p).await;
+        }
+        if fresh {
+            stats.mac_us.push(handed_over.elapsed().as_micros() as u64);
         }
         if history.len() == HISTORY {
             history.pop_front();
@@ -570,6 +582,11 @@ struct Stats {
     rtt_us: Vec<u64>,
     transfer_us: Vec<u64>,
     decode_us: Vec<u64>,
+    // Mac side, new frames only: frame age at hand-over from ScreenCaptureKit, encoding, and hand-over
+    // until the last packet is sent (waiting for the encoder included).
+    capture_us: Vec<u64>,
+    encode_us: Vec<u64>,
+    mac_us: Vec<u64>,
 }
 
 impl Stats {
@@ -580,6 +597,9 @@ impl Stats {
     /// One line for the menu bar window, e.g. "Wi-Fi RTT 4 ms (3–9) · transfer 6 ms · decoder 11 ms · loss 0.3 %".
     fn summary(&self) -> String {
         let mut parts = Vec::new();
+        if let (Some(c), Some(e), Some(m)) = (Self::ms(&self.capture_us), Self::ms(&self.encode_us), Self::ms(&self.mac_us)) {
+            parts.push(format!("Mac: capture {c:.0} · encode {e:.0} · out {m:.0} ms"));
+        }
         if let Some(avg) = Self::ms(&self.rtt_us) {
             let min = *self.rtt_us.iter().min().unwrap() as f64 / 1000.0;
             let max = *self.rtt_us.iter().max().unwrap() as f64 / 1000.0;
@@ -599,7 +619,10 @@ impl Stats {
         let rung = rung.map_or(String::new(), |r| format!("  rung {r}"));
         let ms = |s: &[u64]| Self::ms(s).map_or("-".into(), |v| format!("{v:.1}"));
         let timing = format!(
-            "  rtt {} ms  xfer {} ms  dec {} ms",
+            "  cap {} enc {} out {} ms  rtt {} ms  xfer {} ms  dec {} ms",
+            ms(&self.capture_us),
+            ms(&self.encode_us),
+            ms(&self.mac_us),
             ms(&self.rtt_us),
             ms(&self.transfer_us),
             ms(&self.decode_us)

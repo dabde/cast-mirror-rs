@@ -147,7 +147,19 @@ Measured at 60 fps over Wi-Fi: round trip 6-16 ms (so ~3-8 ms one way), transfer
 size, decoder 23 ms. The decoder number was one frame interval plus ~6 ms (39.5 ms at 30 fps): the MediaTek
 decoder holds each frame until the next one starts. The app now appends an access unit delimiter to every
 frame, which marks that boundary at once: decoder 6 ms at 30 and 60 fps, so ~17 ms less end to end at 60 fps
-and ~33 ms at 30 fps (from the per-stage numbers; not re-measured with the lag wheel yet).
+and ~33 ms at 30 fps. The H.264 decoder ignores the delimiter and keeps holding the frame (24 ms at 60 fps).
+
+On the Mac, per new frame at 60 fps: frame age when ScreenCaptureKit hands it over 0.5 ms, HEVC encoding 8.5 ms,
+hand-over to the last packet sent 8.7 ms. With the TV side that is ~20-25 ms from capture to decoded frame.
+
+Lag wheel, phone photos of both screens (2026-10-25, 3 each, averaged): TV app (HEVC, 60 fps, GPU plane) ~90 ms,
+Chromecast dongle (`--delay 60`) ~110 ms. So ~65 ms of the TV app's path lie after the decoder: TextureView,
+Android's compositor and the panel, about four 60 Hz refreshes.
+
+MJPEG was checked and dropped: the TV has a hardware decoder for it (`OMX.MTK.VIDEO.DECODER.MJPEG`) and
+VideoToolbox encodes JPEG in hardware in ~2 ms, but a 1670x1080 desktop frame is 137 KB at quality 0.5 (67 Mbit/s
+at 60 fps) against ~12 KB for HEVC. Frame transfer grows with size (HEVC: ~4.5 ms for 12 KB), so the ~6 ms saved
+in encoding would be lost several times over on the air.
 
 **Encryption (protocol v3):** every packet in both directions is AES-128-GCM sealed: payload encrypted,
 header authenticated, a counter per packet as nonce, so resends get fresh nonces. The key is random per session
