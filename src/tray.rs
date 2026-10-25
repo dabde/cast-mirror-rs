@@ -44,6 +44,9 @@ const PROFILES: [Profile; 6] = [
     Profile { name: "Auto", detail: "TV app: adapts to the Wi-Fi", delay: 100, fps: 60, width: 1920, bitrate: 6_000_000, auto: true },
 ];
 const DEFAULT_PROFILE: usize = 1;
+const BROWSER: &str = "Browser (iPad, laptop…)";
+// Measured on an iPad Pro over Wi-Fi at its native resolution: 10 looked blocky in motion, 30 still fit.
+const BROWSER_BITRATE: u32 = 20_000_000;
 const WIDTH: f64 = 320.0;
 
 enum Ui {
@@ -103,6 +106,8 @@ struct Device {
     name: String,
     addr: String,
     direct: bool,
+    // The browser receiver: `web::run` serves a page instead of casting to an address.
+    web: bool,
     adb: bool,
     id: Option<String>,
     paired: bool,
@@ -148,6 +153,8 @@ struct State {
     // Name of the device whose pairing code the window asks for, and the last pairing problem.
     pairing: Option<String>,
     pair_error: String,
+    // The browser receiver's link and its QR code (SVG).
+    link: Option<(String, String)>,
 }
 
 impl State {
@@ -163,9 +170,11 @@ impl State {
             "casting": casting,
             "source": source,
             "receivers": self.devices.iter().map(|d| serde_json::json!({
-                "name": d.name, "direct": d.direct, "needsPairing": d.needs_pairing(),
+                "name": d.name, "direct": d.direct, "web": d.web, "needsPairing": d.needs_pairing(),
             })).collect::<Vec<_>>(),
             "pairing": self.pairing,
+            "link": self.link.as_ref().map(|(url, _)| url),
+            "qr": self.link.as_ref().map(|(_, svg)| svg),
             "pairError": self.pair_error,
             "selected": self.selected,
             "screens": self.screens,
@@ -176,6 +185,20 @@ impl State {
             "encrypt": self.encrypt,
         })
         .to_string()
+    }
+
+    /// The link and its QR code while the browser receiver is selected.
+    fn refresh_link(&mut self) {
+        self.link = self.device().filter(|d| d.web).and_then(|_| {
+            let url = crate::web::link().inspect_err(|e| tracing::warn!("browser link: {e:#}")).ok()?;
+            let qr = qrcode::QrCode::new(&url).ok()?;
+            let svg = qr
+                .render::<qrcode::render::svg::Color>()
+                .min_dimensions(180, 180)
+                .quiet_zone(true)
+                .build();
+            Some((url, svg))
+        });
     }
 
     fn device(&self) -> Option<&Device> {
@@ -237,6 +260,7 @@ pub fn run() -> Result<()> {
         encrypt: true,
         pairing: None,
         pair_error: String::new(),
+        link: None,
     };
     // A pairing request the device answered; the code the user types finishes it.
     let pending: Arc<std::sync::Mutex<Option<crate::pairing::Pending>>> = Arc::default();
@@ -359,6 +383,7 @@ pub fn run() -> Result<()> {
                     }
                     Cmd::Receiver { name } => {
                         state.selected = Some(name);
+                        state.refresh_link();
                         restart = casting;
                     }
                     Cmd::Profile { index } => {
@@ -410,13 +435,25 @@ pub fn run() -> Result<()> {
                         let name = format!("{} · TV app", f.name);
                         let paired = f.id.as_deref().is_some_and(|id| store.is_paired(id));
                         let (addr, adb, id) = (f.addr.clone(), f.adb, f.id.clone());
-                        state.devices.push(Device { name, addr, direct: true, adb, id, paired });
+                        state.devices.push(Device { name, addr, direct: true, web: false, adb, id, paired });
                     }
                     if f.cast {
-                        let device = Device { name: f.name, addr: f.addr, direct: false, adb: false, id: None, paired: false };
+                        let (name, addr) = (f.name, f.addr);
+                        let device = Device { name, addr, direct: false, web: false, adb: false, id: None, paired: false };
                         state.devices.push(device);
                     }
                 }
+                let browser = Device {
+                    name: BROWSER.into(),
+                    addr: String::new(),
+                    direct: false,
+                    web: true,
+                    adb: false,
+                    id: None,
+                    paired: false,
+                };
+                state.devices.push(browser);
+                state.refresh_link();
                 if state.device().is_none() {
                     let first = state.devices.iter().find(|d| !d.direct).or(state.devices.first());
                     state.selected = first.map(|d| d.name.clone());
@@ -525,7 +562,12 @@ pub fn run() -> Result<()> {
                 Target::Display(i, _) => args.display = *i,
                 Target::Window(id, _) => args.window = Some(id.to_string()),
             }
-            let direct = device.direct;
+            let (direct, web) = (device.direct, device.web);
+            if web {
+                // The profiles are about Cast buffers; the browser path has none and runs 60 fps fine.
+                args.bitrate = BROWSER_BITRATE;
+                args.fps = 60;
+            }
             if direct {
                 // HEVC: the TV's MediaTek HEVC decoder buffers less than its H.264 one.
                 args.codecs = vec![crate::Codec::Hevc];
@@ -550,7 +592,9 @@ pub fn run() -> Result<()> {
                 let session = || -> Result<()> {
                     let rt = tokio::runtime::Runtime::new()?;
                     rt.block_on(async {
-                        if direct {
+                        if web {
+                            crate::web::run(args, control).await
+                        } else if direct {
                             crate::direct::run(args, control).await
                         } else {
                             mirror::run(args, Source::Screen, control).await
@@ -570,7 +614,8 @@ pub fn run() -> Result<()> {
             changed = true;
         }
         // Mute only while audio actually goes to the receiver; direct mode sends none.
-        let direct = state.device().is_some_and(|d| d.direct);
+        // The browser and the TV app get no audio, so muting the Mac would only silence it.
+        let direct = state.device().is_some_and(|d| d.direct || d.web);
         set_output_muted(stop.is_some() && state.mute && state.audio && !direct, &mut muted_by_us);
         if changed {
             render(&webview, &state, stop.is_some());

@@ -458,6 +458,12 @@ async fn stream(
     Ok(next)
 }
 
+/// The link the receiving device opens (creates the certificate and token on first use).
+pub fn link() -> Result<String> {
+    let (_, token, ip) = identity()?;
+    Ok(format!("https://{ip}:{PORT}/#{token}"))
+}
+
 /// The TLS config with a self-signed certificate for this Mac's names, the access token, and the LAN IP.
 /// Both are kept in Application Support so the browser's exception and bookmarked links stay valid; the
 /// certificate is renewed when the IP changes.

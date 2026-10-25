@@ -148,6 +148,12 @@
   .pair button { padding: 4px 8px; border-radius: 6px; background: var(--line); }
   .pair button.primary { background: var(--accent); color: #fff; }
   .pair .detail { font-size: 11px; color: var(--dim); margin-top: 4px; min-height: 13px; }
+  .link { display: none; gap: 10px; align-items: center; padding: 6px; margin: 4px 0; border-radius: 8px; background: var(--hover); }
+  .link.on { display: flex; }
+  .qr { flex: none; width: 110px; height: 110px; background: #fff; border-radius: 6px; padding: 4px; }
+  .qr svg { width: 100%; height: 100%; display: block; }
+  .linkText { min-width: 0; font-size: 11px; color: var(--dim); }
+  .url { color: var(--fg); font: 11px ui-monospace, Menlo, monospace; word-break: break-all; -webkit-user-select: text; margin: 4px 0; }
   .warning {
     display: none;
     color: var(--danger);
@@ -198,6 +204,15 @@
       <button onclick="send({cmd: 'pairCancel'})">Cancel</button>
     </div>
     <div class="detail" id="pairError"></div>
+  </div>
+
+  <div id="link" class="link">
+    <div class="qr" id="qr"></div>
+    <div class="linkText">
+      <div>Scan with the iPad camera, or open:</div>
+      <div class="url" id="url"></div>
+      <div class="detail">The first time, the browser warns about the certificate: continue anyway.</div>
+    </div>
   </div>
 
   <h2><span>PROFILE</span></h2>
@@ -274,13 +289,21 @@
 
     const receivers = document.getElementById("receivers");
     receivers.replaceChildren(...(s.receivers.length ? s.receivers.map((r) =>
-      row(r.direct ? "bolt.fill" : "tv", r.name,
+      row(r.web ? "globe" : r.direct ? "bolt.fill" : "tv", r.name,
+        r.web ? "Any browser: scan the code below" :
         r.direct ? (r.needsPairing ? "TV app: pair once with a code" : "Direct to the TV app, lowest latency") : "Cast",
         r.name === s.selected, () => send({cmd: "receiver", name: r.name})))
       : [el("div", "empty", "Looking for receivers…")]));
 
     document.getElementById("profiles").replaceChildren(...s.profiles.map((p, i) =>
       row(null, p.name, p.detail, i === s.profile, () => send({cmd: "profile", index: i}))));
+
+    document.getElementById("link").classList.toggle("on", !!s.link);
+    document.getElementById("url").textContent = s.link || "";
+    if (s.qr && document.getElementById("qr").dataset.url !== s.link) {
+      document.getElementById("qr").innerHTML = s.qr;
+      document.getElementById("qr").dataset.url = s.link;
+    }
 
     const pair = document.getElementById("pair");
     const opening = s.pairing && !pair.classList.contains("on");
