@@ -154,7 +154,10 @@ hand-over to the last packet sent 8.7 ms. With the TV side that is ~20-25 ms fro
 
 Lag wheel, phone photos of both screens (2026-10-25, 3 each, averaged): TV app (HEVC, 60 fps, GPU plane) ~90 ms,
 Chromecast dongle (`--delay 60`) ~110 ms. So ~65 ms of the TV app's path lie after the decoder: TextureView,
-Android's compositor and the panel, about four 60 Hz refreshes.
+Android's compositor and the panel, about four 60 Hz refreshes. The compositor alone takes ~24 ms from a ready
+buffer to the screen (`dumpsys SurfaceFlinger --latency`, 1.5 refreshes). Drawing each frame with an own OpenGL
+thread onto a SurfaceView (instead of TextureView waiting for the UI thread) stayed on the graphics plane but made
+no difference, neither in the compositor (23.8 vs 24.5 ms) nor on the lag wheel, so it was dropped.
 
 MJPEG was checked and dropped: the TV has a hardware decoder for it (`OMX.MTK.VIDEO.DECODER.MJPEG`) and
 VideoToolbox encodes JPEG in hardware in ~2 ms, but a 1670x1080 desktop frame is 137 KB at quality 0.5 (67 Mbit/s
