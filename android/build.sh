@@ -17,9 +17,9 @@ if [ "${GAME:-}" = 1 ]; then
 fi
 $bt/aapt2 compile --dir res -o build/res.zip
 $bt/aapt2 link -o build/base.apk -I $jar --manifest $manifest --java build/gen \
-  --min-sdk-version 30 --target-sdk-version 34 build/res.zip
+  --min-sdk-version 28 --target-sdk-version 34 build/res.zip
 javac -source 17 -target 17 -nowarn -cp $jar -d build/classes $(find src build/gen -name '*.java')
-$bt/d8 --release --min-api 30 --lib $jar --output build/dex $(find build/classes -name '*.class')
+$bt/d8 --release --min-api 28 --lib $jar --output build/dex $(find build/classes -name '*.class')
 (cd build/dex && zip -q ../base.apk classes.dex)
 $bt/zipalign -f 4 build/base.apk build/aligned.apk
 [ -f debug.keystore ] || keytool -genkeypair -keystore debug.keystore -storepass android -keypass android \

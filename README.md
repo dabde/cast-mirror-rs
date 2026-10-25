@@ -162,6 +162,11 @@ Android offers apps on this TV a single 60 Hz mode (`dumpsys display`: no altern
 no minimal post-processing), so ~90 ms is about the floor of the app path here; lower needs a receiver on an
 HDMI input in Game mode, e.g. an Android TV box running the same app.
 
+The app runs on Android 9 phones too (`--direct` to the phone's IP, network ADB via `adb tcpip 5555`). On a
+Huawei P10 (Kirin 960, `OMX.hisi.video.decoder.hevc`) the decoder takes 33 ms at 60 fps and 51 ms at 30 fps:
+one held frame plus ~16 ms of decoding. The access unit delimiter does not help there, nor does HiSilicon's
+low-latency scene key (`vendor.hisi-ext-low-latency-video-dec…`); H.264 is worse (52 ms at 60 fps).
+
 MJPEG was checked and dropped: the TV has a hardware decoder for it (`OMX.MTK.VIDEO.DECODER.MJPEG`) and
 VideoToolbox encodes JPEG in hardware in ~2 ms, but a 1670x1080 desktop frame is 137 KB at quality 0.5 (67 Mbit/s
 at 60 fps) against ~12 KB for HEVC. Frame transfer grows with size (HEVC: ~4.5 ms for 12 KB), so the ~6 ms saved

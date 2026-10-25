@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.graphics.Color;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
@@ -77,7 +78,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
         super.onCreate(state);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         // Asks the TV for its game-mode-like path (ALLM); the TV may ignore it.
-        getWindow().setPreferMinimalPostProcessing(true);
+        if (Build.VERSION.SDK_INT >= 30) {
+            getWindow().setPreferMinimalPostProcessing(true);
+        }
         FrameLayout root = new FrameLayout(this);
         // Default: composite decoded frames through the GPU (graphics plane, like a game) instead of
         // the TV's video plane, which runs its heavier picture processing.
@@ -515,6 +518,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
 
     /** MediaTek rejects KEY_LOW_LATENCY but may offer its own switch; log what exists, turn on what fits. */
     private static void enableVendorLowLatency(MediaCodec codec) {
+        if (Build.VERSION.SDK_INT < 31) {
+            return; // Vendor parameters arrived in Android 12; on older phones this would not even link.
+        }
         try {
             List<String> names = codec.getSupportedVendorParameters();
             Log.i(TAG, "vendor parameters: " + names);
