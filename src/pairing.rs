@@ -50,8 +50,16 @@ impl Store {
     }
 
     pub fn load() -> Self {
-        let mut store: Self =
-            std::fs::read(Self::path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let path = Self::path();
+        let mut store: Self = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                let aside = path.with_extension("json.broken");
+                tracing::warn!("{} is damaged ({e}); kept as {}, pairings start empty", path.display(), aside.display());
+                let _ = std::fs::rename(&path, aside);
+                Self::default()
+            }),
+            Err(_) => Self::default(),
+        };
         if store.mac_id.len() != 32 {
             store.mac_id = hex(&random::<16>());
         }
@@ -62,8 +70,11 @@ impl Store {
         use std::os::unix::fs::OpenOptionsExt;
         let path = Self::path();
         std::fs::create_dir_all(path.parent().unwrap())?;
-        let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&path)?;
+        let new = path.with_extension("json.new");
+        let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&new)?;
         std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
+        std::fs::rename(new, path)?;
         Ok(())
     }
 
@@ -149,6 +160,10 @@ pub async fn begin(addr: SocketAddr, store: &Store) -> Result<Pending> {
 }
 
 impl Pending {
+    pub fn device_id(&self) -> String {
+        hex(&self.device_id)
+    }
+
     /// Checks `code`; on success both sides store the key. A wrong code leaves the app waiting for a new request.
     pub async fn finish(self, code: &str, store: &mut Store) -> Result<String> {
         let lt = long_term(code, &self.secret, &self.mac_public, &self.app_public, &self.mac_nonce, &self.app_nonce);
@@ -299,6 +314,70 @@ mod tests {
         assert_ne!(base, long_term("7K3QD-M0XPB", b"secret", b"mac", b"app", b"m", b"a"));
         assert_ne!(base, long_term("7K3QD-M0XPA", b"secret", b"app", b"mac", b"m", b"a"));
         assert_ne!(base, long_term("7K3QD-M0XPA", b"secret", b"mac", b"app", b"a", b"m"));
+    }
+
+    /// Shapes the app's 's' answers from (device id, nonce a, proof).
+    type Reply = fn(&[u8], &[u8], [u8; 32]) -> Vec<Vec<u8>>;
+
+    /// Answers one session like Pairing.java.
+    async fn fake_app(lt: [u8; 32], reply: Reply) -> UdpSocket {
+        let app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let to_app = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        to_app.connect(app.local_addr().unwrap()).await.unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            let device = [7u8; 16];
+            let nonce_a = [9u8; 16];
+            let mut nonce_m = Vec::new();
+            loop {
+                let (n, from) = app.recv_from(&mut buf).await.unwrap();
+                match &buf[..3] {
+                    b"CAs" => {
+                        nonce_m = buf[19..n].to_vec();
+                        for answer in reply(&device, &nonce_a, mac(&lt, &[b"s2".as_slice(), &nonce_m, &nonce_a])) {
+                            app.send_to(&answer, from).await.unwrap();
+                        }
+                    }
+                    b"CAt" if buf[3..n] == mac(&lt, &[b"s3".as_slice(), &nonce_m, &nonce_a]) => {
+                        app.send_to(b"t\x01", from).await.unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        });
+        to_app
+    }
+
+    fn store_with(lt: [u8; 32]) -> Store {
+        let mut store = Store { mac_id: hex(&[1u8; 16]), devices: BTreeMap::new() };
+        store.devices.insert(hex(&[7u8; 16]), Paired { name: "TV".into(), key: hex(&lt) });
+        store
+    }
+
+    #[tokio::test]
+    async fn session_agrees_on_the_key_only_with_a_correct_proof() {
+        let lt = [3u8; 32];
+        let store = store_with(lt);
+        let good = |d: &[u8], a: &[u8], proof: [u8; 32]| vec![[b"s".as_slice(), d, a, &proof].concat()];
+        let socket = fake_app(lt, good).await;
+        let key = session(&socket, &store).await.unwrap();
+        assert_eq!(key.len(), 16);
+
+        // A resent reply (UDP retries) arrives twice: still one clean session.
+        let twice = |d: &[u8], a: &[u8], proof: [u8; 32]| vec![[b"s".as_slice(), d, a, &proof].concat(); 2];
+        assert!(session(&fake_app(lt, twice).await, &store).await.is_ok());
+
+        let wrong = |d: &[u8], a: &[u8], _: [u8; 32]| vec![[b"s".as_slice(), d, a, &[0u8; 32]].concat()];
+        assert!(matches!(session(&fake_app(lt, wrong).await, &store).await, Err(NoSession::NotPaired(_))), "wrong proof");
+
+        let short = |d: &[u8], a: &[u8], proof: [u8; 32]| vec![[b"s".as_slice(), d, a, &proof[..10]].concat()];
+        assert!(matches!(session(&fake_app(lt, short).await, &store).await, Err(NoSession::NotPaired(_))), "short reply");
+
+        let unknown = |d: &[u8], _: &[u8], _: [u8; 32]| vec![[b"u".as_slice(), d].concat()];
+        assert!(matches!(session(&fake_app(lt, unknown).await, &store).await, Err(NoSession::NotPaired(_))), "'u' reply");
+
+        let other_key = store_with([4u8; 32]);
+        assert!(session(&fake_app(lt, good).await, &other_key).await.is_err(), "the app holds a different key");
     }
 
     #[test]

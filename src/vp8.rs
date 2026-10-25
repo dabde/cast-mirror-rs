@@ -19,13 +19,14 @@ pub struct Vp8Encoder {
     i420: Vec<u8>,
     width: usize,
     height: usize,
+    frame_us: u64,
 }
 
 // The libvpx context is only touched through &mut self.
 unsafe impl Send for Vp8Encoder {}
 
 impl Vp8Encoder {
-    pub fn new(width: u32, height: u32, bitrate: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
         unsafe {
             let iface = vpx::vpx_codec_vp8_cx();
             let mut cfg = MaybeUninit::<vpx::vpx_codec_enc_cfg_t>::zeroed().assume_init();
@@ -50,7 +51,7 @@ impl Vp8Encoder {
             // Speed over quality for real time: libvpx's 6..16 range for VP8.
             vpx::vpx_codec_control_(&mut ctx, vpx::vp8e_enc_control_id::VP8E_SET_CPUUSED as i32, 12i32);
             let (w, h) = (width as usize, height as usize);
-            Ok(Self { ctx, cfg, i420: vec![0; w * h * 3 / 2], width: w, height: h })
+            Ok(Self { ctx, cfg, i420: vec![0; w * h * 3 / 2], width: w, height: h, frame_us: 1_000_000 / u64::from(fps.max(1)) })
         }
     }
 
@@ -87,7 +88,7 @@ impl Vp8Encoder {
                 &mut self.ctx,
                 &img,
                 pts.as_micros() as i64,
-                33_333,
+                self.frame_us,
                 flags,
                 vpx::VPX_DL_REALTIME as _,
             );
@@ -161,7 +162,7 @@ mod tests {
 
     #[test]
     fn encodes_key_then_delta() {
-        let mut enc = Vp8Encoder::new(320, 180, 1_000_000).unwrap();
+        let mut enc = Vp8Encoder::new(320, 180, 30, 1_000_000).unwrap();
         let frame = solid_frame(320, 180, (81, 90, 240)).unwrap();
         let first = enc.encode(&frame, Duration::ZERO, true).unwrap().unwrap();
         // VP8 key frame: bit 0 of the first byte is 0, start code 9d 01 2a at offset 3.

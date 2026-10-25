@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
-use ring::rand::SecureRandom;
 use tokio::net::UdpSocket;
 use tracing::{info, warn};
 
@@ -74,28 +73,26 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
     let key = if args.no_encryption {
         warn!("direct mode UNENCRYPTED: anyone on the network can watch the stream and inject frames");
         (control.status)("Starting the TV app over ADB…".into());
-        start_tv_app(&host, gpu, None).await?;
+        start_tv_app(&host, gpu, true).await?;
         None
     } else {
-        // An open, paired app takes a session over the network; otherwise ADB starts it with a fresh key.
-        match crate::pairing::session(&socket, &crate::pairing::Store::load()).await {
-            Ok(key) => {
-                info!("session agreed over the network");
-                Some(key)
-            }
-            Err(no_session) => {
+        // The key always comes from the pairing handshake: network ADB is unencrypted, so it only starts the app.
+        use crate::pairing::{session, NoSession, Store};
+        let store = Store::load();
+        let pair_hint = format!("pick it in the menu bar window, or run `cast-mirror pair {host}`");
+        let key = match session(&socket, &store).await {
+            Err(NoSession::NoAnswer) => {
                 (control.status)("Starting the TV app over ADB…".into());
-                let mut key = [0u8; 16];
-                ring::rand::SystemRandom::new().fill(&mut key).map_err(|_| anyhow::anyhow!("no system randomness"))?;
-                start_tv_app(&host, gpu, Some(&crate::pairing::hex(&key))).await.map_err(|adb| {
-                    anyhow::anyhow!(
-                        "{no_session}, and ADB can't start it ({adb:#}). Open the app on the device, or pair it: \
-                         pick it in the menu bar window, or run `cast-mirror pair {host}`"
-                    )
+                start_tv_app(&host, gpu, false).await.map_err(|adb| {
+                    anyhow::anyhow!("the app is not open on the device, and ADB can't start it ({adb:#})")
                 })?;
-                Some(key)
+                session(&socket, &store).await
             }
-        }
+            other => other,
+        };
+        let key = key.map_err(|e| anyhow::anyhow!("{e}. Pair it once: {pair_hint}"))?;
+        info!("session agreed over the network");
+        Some(key)
     };
     let mut link = Link::new(socket, key.map(|k| Crypto::new(&k)));
 
@@ -424,19 +421,16 @@ impl Crypto {
 
 /// (Re)starts the receiver app (android/) over ADB; network debugging must be enabled on the TV.
 /// `gpu`: draw on the graphics plane (fast, 1080p max) instead of the video plane (4K, ~85 ms slower).
-/// `key`: the session's AES key, in hex; ADB is authenticated, so it reaches only this TV. None: unencrypted.
-async fn start_tv_app(host: &str, gpu: bool, key: Option<&str>) -> Result<()> {
+/// `plain`: unencrypted (`--no-encryption`); otherwise the app waits for a paired Mac's session.
+pub async fn start_tv_app(host: &str, gpu: bool, plain: bool) -> Result<()> {
     let serial = format!("{host}:5555");
     let ten = Duration::from_secs(10);
     adb(&["connect", &serial], ten).await.context("running adb (brew install --cask android-platform-tools)")?;
     // -S restarts the activity, so a changed plane choice takes effect.
     let texture = gpu.to_string();
     let activity = format!("{TV_APP}/.MainActivity");
-    let mut args = vec!["-s", &serial, "shell", "am", "start", "-S", "-n", &activity, "--ez", "texture", &texture];
-    args.extend(match key {
-        Some(key) => ["--es", "key", key],
-        None => ["--ez", "plain", "true"],
-    });
+    let plain = plain.to_string();
+    let args = ["-s", &serial, "shell", "am", "start", "-S", "-n", &activity, "--ez", "texture", &texture, "--ez", "plain", &plain];
     let out = adb(&args, ten).await?;
     let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     if !out.status.success() || text.contains("Error") {

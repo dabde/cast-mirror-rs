@@ -65,10 +65,10 @@ pub struct MirrorArgs {
     #[arg(long, default_value = "6M", value_parser = parse_bitrate)]
     pub bitrate: u32,
     /// Max output width; the picture is fitted into width x (width*9/16) at the display's aspect.
-    #[arg(long, default_value_t = 1920)]
+    #[arg(long, default_value_t = 1920, value_parser = clap::value_parser!(u32).range(320..=7680))]
     pub width: u32,
     /// Target playout delay in ms (Chrome offers 200; Chromecast honours less, Philips' built-in app floors ~150).
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(0..=5000))]
     pub delay: u64,
     #[arg(long)]
     pub no_audio: bool,
@@ -131,7 +131,11 @@ fn parse_bitrate(s: &str) -> Result<u32, String> {
         Some(n) => (n, 1_000_000.0),
         None => s.strip_suffix('k').map_or((s.as_str(), 1.0), |n| (n, 1_000.0)),
     };
-    num.parse::<f64>().map(|n| (n * mult) as u32).map_err(|e| format!("bad bitrate {s:?}: {e}"))
+    let bitrate = num.parse::<f64>().map_err(|e| format!("bad bitrate {s:?}: {e}"))? * mult;
+    if !(100_000.0..=100_000_000.0).contains(&bitrate) {
+        return Err(format!("bitrate {s:?} is outside 100k..100M"));
+    }
+    Ok(bitrate as u32)
 }
 
 /// Resolves a device argument to the receiver's control endpoint.
@@ -184,7 +188,9 @@ fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     if in_app {
         let log = std::env::home_dir().unwrap_or_default().join("Library/Logs/CastMirror.log");
-        let file = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(&log)?;
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600))?;
         tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(file).init();
         // The default hook writes to stderr, which nobody sees in the menu bar app.
         std::panic::set_hook(Box::new(|info| tracing::error!("{info}")));

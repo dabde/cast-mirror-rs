@@ -235,7 +235,9 @@ async fn session(
                 if source == Source::Screen {
                     drop(capture.take());
                     let bounds = capture::box_16_9(width);
-                    let c = Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), audio_tx.clone())?;
+                    let c = tokio::task::block_in_place(|| {
+                        Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), audio_tx.clone())
+                    })?;
                     // Capture fits its own 16:9 box; encode exactly what it delivers.
                     (width, height) = (c.width, c.height);
                     capture = Some(c);
@@ -356,7 +358,7 @@ impl VideoEncoder {
             Codec::H264High => vt(VtCodec::H264High),
             Codec::Hevc => vt(VtCodec::Hevc),
             #[cfg(feature = "vp8")]
-            Codec::Vp8 => Ok(Self::Vp8(Box::new(crate::vp8::Vp8Encoder::new(width, height, bitrate)?))),
+            Codec::Vp8 => Ok(Self::Vp8(Box::new(crate::vp8::Vp8Encoder::new(width, height, fps, bitrate)?))),
             #[cfg(not(feature = "vp8"))]
             Codec::Vp8 => Err(anyhow!("VP8 needs a build with --features vp8")),
         }
@@ -573,7 +575,7 @@ impl Stats {
             self.frames,
             self.bytes * 8 / 1000,
             target / 1000,
-            v.packets_retransmitted - self.retransmitted,
+            v.packets_retransmitted.saturating_sub(self.retransmitted),
             self.dropped,
             v.in_flight_frames,
             v.in_flight_media_duration.as_millis(),

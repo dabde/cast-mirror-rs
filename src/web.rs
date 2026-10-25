@@ -75,7 +75,9 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
     capture::ensure_permission()?;
     let (tls, token, ip) = identity()?;
     let url = format!("https://{ip}:{PORT}/#{token}");
-    info!("open {url} on the receiving device (accept the certificate warning once)");
+    // The link carries the access token: the terminal (stderr) and the menu bar window show it, the log file not.
+    eprintln!("open {url} on the receiving device (accept the certificate warning once)");
+    info!("browser receiver waiting on port {PORT}");
     (control.status)(format!("Waiting for a browser: {url}"));
 
     let listener = TcpListener::bind(("0.0.0.0", PORT)).await.with_context(|| format!("port {PORT}"))?;
@@ -365,6 +367,8 @@ async fn stream(
     let mut rtts: Vec<u64> = Vec::new();
     let mut calm_since = Instant::now();
     let mut last_key = None::<Instant>;
+    // The view's latest size, applied on the next stats tick: each change rebuilds capture and encoder.
+    let mut wanted = None::<(u32, u32)>;
     let mut report = tokio::time::interval(Duration::from_secs(1));
     let mut ping = tokio::time::interval(Duration::from_millis(200));
     let refresh = Duration::from_secs(1) / fps;
@@ -378,37 +382,7 @@ async fn stream(
                 match r {
                     Some(Request::KeyFrame) => need_key = true,
                     Some(Request::Echo(sent_at)) => rtts.push(now_us().saturating_sub(sent_at)),
-                    Some(Request::Resize(width, height)) if (width, height) != bounds => {
-                        bounds = (width, height);
-                        if let Some(d) = &extended {
-                            // Same display in a new mode, so the windows on it stay.
-                            let (w, h) = crate::virtual_display::scaled(bounds, args.scale);
-                            d.set_mode(w, h, hidpi(bounds))?;
-                            tokio::time::sleep(Duration::from_millis(300)).await;
-                        }
-                        drop(cap);
-                        (cap, encoder) = tokio::task::block_in_place(|| -> Result<_> {
-                            let cap = Capture::start(display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
-                            let mut encoder = VideoEncoder::new(Codec::H264High, cap.width, cap.height, fps, bitrate)?;
-                            encoder.set_max_qp(args.max_qp);
-                            Ok((cap, encoder))
-                        })?;
-                        info!("browser {peer}: view {bounds:?}, sending {}x{}", cap.width, cap.height);
-                        // The page starts over from the next key frame, decoder included (new size).
-                        let reset = b"r".to_vec();
-                        match &channel {
-                            Some(c) => {
-                                let _ = c.try_send([&[0xff], &reset[..]].concat());
-                            }
-                            None => {
-                                let _ = ws_tx.try_send(frame_bytes(1, &reset));
-                            }
-                        }
-                        last = None;
-                        need_key = true;
-                        last_key = None;
-                    }
-                    Some(Request::Resize(..)) => {}
+                    Some(Request::Resize(width, height)) => wanted = Some((width, height)),
                     Some(Request::Offer(sdp)) => match webrtc(&sdp, lan, peer, requests_tx.clone()).await {
                         Ok((answer, frames)) => {
                             pending_channel = Some(frames);
@@ -447,6 +421,36 @@ async fn stream(
                 continue;
             }
             _ = report.tick() => {
+                if let Some(size) = wanted.take().filter(|&size| size != bounds) {
+                    bounds = size;
+                    if let Some(d) = &extended {
+                        // Same display in a new mode, so the windows on it stay.
+                        let (w, h) = crate::virtual_display::scaled(bounds, args.scale);
+                        d.set_mode(w, h, hidpi(bounds))?;
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    drop(cap);
+                    (cap, encoder) = tokio::task::block_in_place(|| -> Result<_> {
+                        let cap = Capture::start(display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
+                        let mut encoder = VideoEncoder::new(Codec::H264High, cap.width, cap.height, fps, bitrate)?;
+                        encoder.set_max_qp(args.max_qp);
+                        Ok((cap, encoder))
+                    })?;
+                    info!("browser {peer}: view {bounds:?}, sending {}x{}", cap.width, cap.height);
+                    // The page starts over from the next key frame, decoder included (new size).
+                    let reset = b"r".to_vec();
+                    match &channel {
+                        Some(c) => {
+                            let _ = c.try_send([&[0xff], &reset[..]].concat());
+                        }
+                        None => {
+                            let _ = ws_tx.try_send(frame_bytes(1, &reset));
+                        }
+                    }
+                    last = None;
+                    need_key = true;
+                    last_key = None;
+                }
                 let rtt = if rtts.is_empty() {
                     String::from("-")
                 } else {
@@ -660,10 +664,11 @@ async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Vec<u8>
     if len > 1 << 16 {
         bail!("frame too large");
     }
-    let mut mask = [0u8; 4];
-    if head[1] & 0x80 != 0 {
-        stream.read_exact(&mut mask).await?;
+    if head[1] & 0x80 == 0 {
+        bail!("unmasked client frame");
     }
+    let mut mask = [0u8; 4];
+    stream.read_exact(&mut mask).await?;
     let mut payload = vec![0u8; len as usize];
     stream.read_exact(&mut payload).await?;
     for (i, b) in payload.iter_mut().enumerate() {

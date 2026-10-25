@@ -249,7 +249,10 @@
       }
       // Pieces of frames already given up never complete.
       for (const old of partial.keys()) if (expected !== null && old < expected) partial.delete(old);
+      // Without a key frame nothing drains: keep about two seconds, the oldest go first.
+      if (partial.size > 64) partial.delete(partial.keys().next().value);
       pending.set(id, buffer);
+      if (pending.size > 120) pending.delete(Math.min(...pending.keys()));
       drain();
     }
   };

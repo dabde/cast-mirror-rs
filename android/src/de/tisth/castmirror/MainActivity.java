@@ -73,10 +73,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     private Pairing pairing;
     private NsdManager nsd;
     private NsdManager.RegistrationListener registration;
-    // AES-128-GCM session key from the sender's `am start --es key`; ADB authenticated that sender.
+    // AES-128-GCM session key, only ever from a paired Mac's session handshake.
     private SecretKeySpec key;
     // Started with `--ez plain true` (cast-mirror --no-encryption): v2 packets, no key.
     private boolean plain;
+    private TextView banner;
     private Cipher opener;
     private Cipher sealer;
     private long sent;
@@ -109,14 +110,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
         label.setTextSize(28);
         label.setGravity(Gravity.CENTER);
         plain = getIntent().getBooleanExtra("plain", false);
-        String hex = getIntent().getStringExtra("key");
-        if (hex != null && hex.length() == 32) {
-            byte[] bytes = new byte[16];
-            for (int i = 0; i < 16; i++) {
-                bytes[i] = (byte) Integer.parseInt(hex.substring(2 * i, 2 * i + 2), 16);
-            }
-            key = new SecretKeySpec(bytes, "AES");
-        }
+        // Any app on the device can start this activity with plain=true, so plain mode stays marked on screen.
+        banner = new TextView(this);
+        banner.setText("Unencrypted: anyone on the network can watch or replace this picture");
+        banner.setTextColor(Color.WHITE);
+        banner.setBackgroundColor(0xc0b00020);
+        banner.setTextSize(14);
+        banner.setGravity(Gravity.CENTER);
+        banner.setPadding(0, 8, 0, 8);
+        banner.setVisibility(plain ? TextView.VISIBLE : TextView.GONE);
         deviceName = deviceName();
         pairing = new Pairing(getSharedPreferences("castmirror", MODE_PRIVATE), deviceName, new Pairing.Listener() {
             @Override
@@ -131,10 +133,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                 key = new SecretKeySpec(sessionKey, "AES");
                 plain = false;
                 sent = 0;
+                runOnUiThread(() -> {
+                    banner.setVisibility(TextView.GONE);
+                    label.setText(waitingText());
+                });
             }
         });
         label.setText(waitingText());
         root.addView(label, new FrameLayout.LayoutParams(-1, -1));
+        root.addView(banner, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
         setContentView(root);
     }
 
@@ -311,6 +318,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
             long lastAsk = 0;
             long lastReport = 0;
             long lastPacket = 0;
+            long lastPairing = -10_000;
             SocketAddress sender = null;
             // Counters for the sender's rate control, reset with every report.
             long seqHigh = -1;
@@ -345,6 +353,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                 boolean foreign = got && sender != null && !sender.equals(packet.getSocketAddress())
                         && now - lastPacket < 300;
                 if (got && n >= 3 && buf[0] == 'C' && buf[1] == 'A') {
+                    // A pairing request costs a key pair and 100 000 PBKDF2 rounds on this thread: none during a
+                    // session, at most one per 2 s (the Mac retries every 0.7 s), so a flood can't stall video.
+                    if (buf[2] == 'p') {
+                        if ((sender != null && now - lastPacket < 2000) || now - lastPairing < 2000) {
+                            continue;
+                        }
+                        lastPairing = now;
+                    }
                     // Pairing and session start: replies go back unsealed, the handshake protects itself.
                     byte[] reply = pairing.handle(buf, n);
                     if (reply != null) {

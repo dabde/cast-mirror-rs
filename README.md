@@ -211,11 +211,11 @@ at 60 fps) against ~12 KB for HEVC. Frame transfer grows with size (HEVC: ~4.5 m
 in encoding would be lost several times over on the air.
 
 **Encryption (protocol v3):** every packet in both directions is AES-128-GCM sealed: payload encrypted,
-header authenticated, a counter per packet as nonce, so resends get fresh nonces. The key is random per session
-and reaches the app with the start intent over ADB, which the TV authenticated when it accepted this Mac; that is
-why `--direct` now starts the app itself. Started by hand without a key, the app only asks to cast from the Mac. `--no-encryption` (in the
-menu bar app: switch off "Encrypt the stream", which then shows a warning) sends v2 packets in the clear, e.g. to
-inspect them in Wireshark; anyone on the network can then watch the stream and inject frames.
+header authenticated, a counter per packet as nonce, so resends get fresh nonces. The session key always comes
+from the pairing handshake below: network ADB (`adb tcpip`) is unencrypted, so ADB only starts the app and never
+carries a key. `--no-encryption` (in the menu bar app: switch off "Encrypt the stream", which then shows a warning)
+sends v2 packets in the clear, e.g. to inspect them in Wireshark; anyone on the network can then watch the stream
+and inject frames, and the TV shows a red "Unencrypted" banner the whole time.
 Cost: 24 bytes per packet (payload 1376 instead of 1400); fps unchanged in a 2 % loss test.
 
 **Without ADB:** the app announces itself on the network (`_castmirror._udp`) while it is open, so it also
@@ -224,8 +224,9 @@ once: casting to an unpaired device asks for the code it shows (or `cast-mirror 
 sides do an ECDH P-256 exchange and mix the code into the result (PBKDF2, 100 000 rounds), so a man in the middle
 has to guess the code; each stores the resulting key (Mac: `~/Library/Application Support/CastMirror/paired.json`,
 mode 600; app: its preferences). Every later start proves the key both ways and derives a fresh session key in
-~0.1 s, without any input. `--direct` tries that first and falls back to starting the app over ADB; the app still
-has to be opened by hand without ADB, Android does not let the Mac start it. Details in `src/pairing.rs`.
+~0.1 s, without any input. If the app isn't open, `--direct` starts it over ADB and then does the same; without
+ADB it has to be opened by hand, Android does not let the Mac start it. The app answers at most one pairing
+request per 2 s and none during a session. Details in `src/pairing.rs`.
 
 **Loss and congestion:** the app NACKs missing packets (and whole missing frames) and the sender
 resends them from a 120-frame history; a frame is only given up after 60 ms without progress while a later one is

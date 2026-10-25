@@ -124,7 +124,7 @@ struct Device {
 impl Device {
     /// The TV app with neither ADB nor a stored key: cast only after pairing.
     fn needs_pairing(&self) -> bool {
-        self.direct && !self.adb && !self.paired
+        self.direct && !self.paired
     }
 }
 
@@ -282,11 +282,22 @@ pub fn run() -> Result<()> {
     let pending: Arc<std::sync::Mutex<Option<crate::pairing::Pending>>> = Arc::default();
     let start_pairing = {
         let (pending, proxy) = (pending.clone(), proxy.clone());
-        move |rt: &tokio::runtime::Runtime, addr: String| {
+        move |rt: &tokio::runtime::Runtime, addr: String, adb: bool| {
             let (pending, proxy) = (pending.clone(), proxy.clone());
             rt.spawn(async move {
-                let event = match async { crate::pairing::begin(addr.parse()?, &crate::pairing::Store::load()).await }.await {
-                    Ok(p) => {
+                let begin = async {
+                    let ip = addr.parse::<std::net::SocketAddr>()?.ip();
+                    if adb {
+                        let _ = proxy.send_event(Ui::Status("Starting the TV app over ADB…".into()));
+                        crate::direct::start_tv_app(&ip.to_string(), true, false).await?;
+                    }
+                    let store = crate::pairing::Store::load();
+                    anyhow::Ok((crate::pairing::begin((ip, crate::direct::PORT).into(), &store).await?, store))
+                };
+                let event = match begin.await {
+                    // Paired before, only not announcing when the list was made: no code needed.
+                    Ok((p, store)) if store.is_paired(&p.device_id()) => Ui::Paired(p.device_id()),
+                    Ok((p, _)) => {
                         *pending.lock().unwrap() = Some(p);
                         Ui::PairWaiting
                     }
@@ -492,8 +503,13 @@ pub fn run() -> Result<()> {
             }
             Event::UserEvent(Ui::Paired(id)) => {
                 tracing::info!("paired with {id}");
-                for d in state.devices.iter_mut().filter(|d| d.id.as_deref() == Some(id.as_str())) {
-                    d.paired = true;
+                // A device found through ADB alone learns its id here.
+                let selected = state.selected.clone();
+                for d in state.devices.iter_mut() {
+                    if d.id.as_deref() == Some(id.as_str()) || (d.direct && d.id.is_none() && Some(&d.name) == selected.as_ref()) {
+                        d.id = Some(id.clone());
+                        d.paired = true;
+                    }
                 }
                 state.pairing = None;
                 state.pair_error.clear();
@@ -504,7 +520,7 @@ pub fn run() -> Result<()> {
                 tracing::warn!("pairing: {error}");
                 // A wrong code ends that request on our side: ask again, the device shows a fresh code.
                 if error.contains("wrong code") && let Some(device) = state.device() {
-                    start_pairing(&rt, device.addr.clone());
+                    start_pairing(&rt, device.addr.clone(), device.adb);
                     state.pair_error = "Wrong code. The device shows a new one.".into();
                 } else {
                     state.pair_error = error;
@@ -554,13 +570,14 @@ pub fn run() -> Result<()> {
             state.status = "Restarting…".into();
         }
 
-        // An unpaired TV app that ADB can't start: pair first, casting begins once paired.
-        let unpaired = state.device().filter(|d| d.needs_pairing() && state.encrypt).map(|d| (d.name.clone(), d.addr.clone()));
-        if begin && stop.is_none() && let Some((name, addr)) = unpaired {
+        // An unpaired TV app: pair first, casting begins once paired.
+        let unpaired =
+            state.device().filter(|d| d.needs_pairing() && state.encrypt).map(|d| (d.name.clone(), d.addr.clone(), d.adb));
+        if begin && stop.is_none() && let Some((name, addr, adb)) = unpaired {
             if state.pairing.is_none() {
                 state.pairing = Some(name);
                 state.pair_error = "Asking the device for a code…".into();
-                start_pairing(&rt, addr);
+                start_pairing(&rt, addr, adb);
             }
             begin = false;
             changed = true;
@@ -714,12 +731,12 @@ fn shorten(text: &str) -> String {
 /// Starts this app again once the current process has exited (a second instance would add a second icon).
 fn relaunch_after_exit() -> Result<()> {
     let exe = std::env::current_exe()?;
-    let target = match exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")) {
-        Some(bundle) => format!("open {:?}", bundle),
-        None => format!("{:?} tray", exe),
+    let (target, run) = match exe.ancestors().find(|p| p.extension().is_some_and(|e| e == "app")) {
+        Some(bundle) => (bundle.to_path_buf(), "open \"$0\""),
+        None => (exe.clone(), "\"$0\" tray"),
     };
-    let script = format!("while kill -0 {} 2>/dev/null; do sleep 0.2; done; {target}", std::process::id());
-    std::process::Command::new("/bin/sh").args(["-c", &script]).spawn()?;
+    let script = format!("while kill -0 {} 2>/dev/null; do sleep 0.2; done; {run}", std::process::id());
+    std::process::Command::new("/bin/sh").arg("-c").arg(script).arg(target).spawn()?;
     Ok(())
 }
 
