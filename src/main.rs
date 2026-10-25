@@ -2,6 +2,7 @@ mod audio;
 mod capture;
 mod direct;
 mod mirror;
+mod pairing;
 mod tray;
 mod video;
 #[cfg(feature = "vp8")]
@@ -35,6 +36,8 @@ enum Command {
     Launch { device: String },
     /// Menu-bar app with receiver and profile selection.
     Tray,
+    /// Pair with the cast-mirror app on a device (its IP), so --direct works without ADB.
+    Pair { device: String },
     /// Stop a running mirroring app (e.g. after the sender was killed).
     Stop { device: String },
     /// Stream a solid colour that changes every second (no screen capture).
@@ -196,6 +199,17 @@ async fn run_cli(cli: Cli) -> Result<()> {
             );
             // close() or a drop would STOP the app again; the process exits right after, closing the socket.
             std::mem::forget(connection);
+            Ok(())
+        }
+        Some(Command::Pair { device }) => {
+            let addr = device.parse().or_else(|_| format!("{device}:{}", direct::PORT).parse())?;
+            let mut store = pairing::Store::load();
+            let pending = pairing::begin(addr, &store).await?;
+            eprint!("Code shown on {}: ", pending.device_name);
+            let mut code = String::new();
+            std::io::stdin().read_line(&mut code)?;
+            pending.finish(&code, &mut store).await?;
+            println!("paired");
             Ok(())
         }
         Some(Command::Stop { device }) => {

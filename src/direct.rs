@@ -55,20 +55,37 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
         .parse()
         .or_else(|_| format!("{device}:{PORT}").parse())
         .with_context(|| format!("not an address: {device}"))?;
-    let key = if args.no_encryption {
-        warn!("direct mode UNENCRYPTED: anyone on the network can watch the stream and inject frames");
-        None
-    } else {
-        let mut key = [0u8; 16];
-        ring::rand::SystemRandom::new().fill(&mut key).map_err(|_| anyhow::anyhow!("no system randomness"))?;
-        Some(key)
-    };
-    (control.status)("Starting the TV app over ADB…".into());
-    let hex = key.map(|k| k.iter().map(|b| format!("{b:02x}")).collect::<String>());
-    // The TV's graphics plane is 1080p: above that, use the (slower) 4K video plane.
-    start_tv_app(&addr.ip().to_string(), args.width <= 1920, hex.as_deref()).await?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(addr).await?;
+    // The TV's graphics plane is 1080p: above that, use the (slower) 4K video plane.
+    let gpu = args.width <= 1920;
+    let host = addr.ip().to_string();
+    let key = if args.no_encryption {
+        warn!("direct mode UNENCRYPTED: anyone on the network can watch the stream and inject frames");
+        (control.status)("Starting the TV app over ADB…".into());
+        start_tv_app(&host, gpu, None).await?;
+        None
+    } else {
+        // An open, paired app takes a session over the network; otherwise ADB starts it with a fresh key.
+        match crate::pairing::session(&socket, &crate::pairing::Store::load()).await {
+            Ok(key) => {
+                info!("session agreed over the network");
+                Some(key)
+            }
+            Err(no_session) => {
+                (control.status)("Starting the TV app over ADB…".into());
+                let mut key = [0u8; 16];
+                ring::rand::SystemRandom::new().fill(&mut key).map_err(|_| anyhow::anyhow!("no system randomness"))?;
+                start_tv_app(&host, gpu, Some(&crate::pairing::hex(&key))).await.map_err(|adb| {
+                    anyhow::anyhow!(
+                        "{no_session}, and ADB can't start it ({adb:#}). Open the app on the device, or pair it: \
+                         pick it in the menu bar window, or run `cast-mirror pair {host}`"
+                    )
+                })?;
+                Some(key)
+            }
+        }
+    };
     let mut link = Link::new(socket, key.map(|k| Crypto::new(&k)));
 
     let codec = args.codecs.first().copied().unwrap_or(Codec::H264);

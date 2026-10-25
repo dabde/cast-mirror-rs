@@ -130,6 +130,24 @@
   }
   .switch.on { background: #30d158; }
   .switch.on::after { left: 16px; }
+  .pair { display: none; padding: 6px; margin: 4px 0; border-radius: 8px; background: var(--hover); }
+  .pair.on { display: block; }
+  .pairRow { display: flex; gap: 6px; margin-top: 6px; }
+  .pair input {
+    flex: 1;
+    min-width: 0;
+    font: 15px ui-monospace, Menlo, monospace;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 4px 6px;
+    border-radius: 6px;
+    border: 0.5px solid var(--line);
+    background: var(--bg);
+    color: var(--fg);
+  }
+  .pair button { padding: 4px 8px; border-radius: 6px; background: var(--line); }
+  .pair button.primary { background: var(--accent); color: #fff; }
+  .pair .detail { font-size: 11px; color: var(--dim); margin-top: 4px; min-height: 13px; }
   .warning {
     display: none;
     color: var(--danger);
@@ -171,6 +189,16 @@
 
   <h2><span>RECEIVER</span><button title="Rescan" onclick="send({cmd: 'rescan'})"><span class="i" style="--i: url(app://localhost/icon/arrow.clockwise)"></span></button></h2>
   <div id="receivers"></div>
+
+  <div id="pair" class="pair">
+    <div>Enter the code shown on <b id="pairName"></b>:</div>
+    <div class="pairRow">
+      <input id="code" placeholder="XXXXX-XXXXX" maxlength="11" autocomplete="off" spellcheck="false">
+      <button class="primary" onclick="submitCode()">Pair</button>
+      <button onclick="send({cmd: 'pairCancel'})">Cancel</button>
+    </div>
+    <div class="detail" id="pairError"></div>
+  </div>
 
   <h2><span>PROFILE</span></h2>
   <div id="profiles"></div>
@@ -246,12 +274,23 @@
 
     const receivers = document.getElementById("receivers");
     receivers.replaceChildren(...(s.receivers.length ? s.receivers.map((r) =>
-      row(r.direct ? "bolt.fill" : "tv", r.name, r.direct ? "Direct to the TV app, lowest latency" : "Cast",
+      row(r.direct ? "bolt.fill" : "tv", r.name,
+        r.direct ? (r.needsPairing ? "TV app: pair once with a code" : "Direct to the TV app, lowest latency") : "Cast",
         r.name === s.selected, () => send({cmd: "receiver", name: r.name})))
       : [el("div", "empty", "Looking for receivers…")]));
 
     document.getElementById("profiles").replaceChildren(...s.profiles.map((p, i) =>
       row(null, p.name, p.detail, i === s.profile, () => send({cmd: "profile", index: i}))));
+
+    const pair = document.getElementById("pair");
+    const opening = s.pairing && !pair.classList.contains("on");
+    pair.classList.toggle("on", !!s.pairing);
+    document.getElementById("pairName").textContent = s.pairing || "";
+    document.getElementById("pairError").textContent = s.pairError;
+    if (opening) {
+      document.getElementById("code").value = "";
+      document.getElementById("code").focus();
+    }
 
     document.getElementById("audio").classList.toggle("on", s.audio);
     document.getElementById("mute").classList.toggle("on", s.mute);
@@ -259,6 +298,15 @@
     document.getElementById("plain").classList.toggle("on", !s.encrypt);
     send({cmd: "height", px: document.getElementById("panel").offsetHeight});
   }
+
+  function submitCode() {
+    const code = document.getElementById("code").value.trim();
+    if (code) send({cmd: "pairCode", code});
+  }
+  document.getElementById("code").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") submitCode();
+    e.stopPropagation();
+  });
 
   window.addEventListener("keydown", (e) => {
     if (e.key === "Escape") send({cmd: "hide"});

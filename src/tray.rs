@@ -56,6 +56,11 @@ enum Ui {
     Stopped(Option<String>),
     // Picked in the macOS window picker: id and "app: title".
     Window(u32, String),
+    // The device shows a pairing code now.
+    PairWaiting,
+    // Paired with the device of this id.
+    Paired(String),
+    PairFailed(String),
 }
 
 /// Commands from `ui.html`.
@@ -73,6 +78,8 @@ enum Cmd {
     Audio { on: bool },
     Mute { on: bool },
     Encrypt { on: bool },
+    PairCode { code: String },
+    PairCancel,
     Rescan,
     Relaunch,
     Quit,
@@ -83,8 +90,12 @@ struct Found {
     name: String,
     addr: String,
     tv_app: bool,
-    // False for a device found only over ADB (a phone after `adb tcpip 5555`): direct mode only.
+    // False for a device found only over ADB or by its own announcement: direct mode only.
     cast: bool,
+    // ADB reaches it and the app is installed, so the app can be started with a fresh key.
+    adb: bool,
+    // The app announced itself on the network with this device id (it is open right now).
+    id: Option<String>,
 }
 
 /// A receiver entry: a Cast receiver, or its TV app (direct mode).
@@ -92,6 +103,16 @@ struct Device {
     name: String,
     addr: String,
     direct: bool,
+    adb: bool,
+    id: Option<String>,
+    paired: bool,
+}
+
+impl Device {
+    /// The TV app with neither ADB nor a stored key: cast only after pairing.
+    fn needs_pairing(&self) -> bool {
+        self.direct && !self.adb && !self.paired
+    }
 }
 
 /// What gets cast: a display (index as `Capture::start` counts them) or a window.
@@ -124,6 +145,9 @@ struct State {
     mute: bool,
     // Direct mode only; off sends the TV app stream unencrypted.
     encrypt: bool,
+    // Name of the device whose pairing code the window asks for, and the last pairing problem.
+    pairing: Option<String>,
+    pair_error: String,
 }
 
 impl State {
@@ -138,7 +162,11 @@ impl State {
             "stats": self.stats,
             "casting": casting,
             "source": source,
-            "receivers": self.devices.iter().map(|d| serde_json::json!({"name": d.name, "direct": d.direct})).collect::<Vec<_>>(),
+            "receivers": self.devices.iter().map(|d| serde_json::json!({
+                "name": d.name, "direct": d.direct, "needsPairing": d.needs_pairing(),
+            })).collect::<Vec<_>>(),
+            "pairing": self.pairing,
+            "pairError": self.pair_error,
             "selected": self.selected,
             "screens": self.screens,
             "profiles": PROFILES.iter().map(|p| serde_json::json!({"name": p.name, "detail": p.detail})).collect::<Vec<_>>(),
@@ -207,6 +235,26 @@ pub fn run() -> Result<()> {
         audio: true,
         mute: false,
         encrypt: true,
+        pairing: None,
+        pair_error: String::new(),
+    };
+    // A pairing request the device answered; the code the user types finishes it.
+    let pending: Arc<std::sync::Mutex<Option<crate::pairing::Pending>>> = Arc::default();
+    let start_pairing = {
+        let (pending, proxy) = (pending.clone(), proxy.clone());
+        move |rt: &tokio::runtime::Runtime, addr: String| {
+            let (pending, proxy) = (pending.clone(), proxy.clone());
+            rt.spawn(async move {
+                let event = match async { crate::pairing::begin(addr.parse()?, &crate::pairing::Store::load()).await }.await {
+                    Ok(p) => {
+                        *pending.lock().unwrap() = Some(p);
+                        Ui::PairWaiting
+                    }
+                    Err(e) => Ui::PairFailed(format!("{e:#}")),
+                };
+                let _ = proxy.send_event(event);
+            });
+        }
     };
     let mut tray: Option<TrayIcon> = None;
     let mut tray_menu = Some(menu);
@@ -326,6 +374,25 @@ pub fn run() -> Result<()> {
                         state.encrypt = on;
                         restart = casting && state.device().is_some_and(|d| d.direct);
                     }
+                    Cmd::PairCode { code } => {
+                        let (pending, proxy) = (pending.clone(), proxy.clone());
+                        state.pair_error = "Checking…".into();
+                        rt.spawn(async move {
+                            let request = pending.lock().unwrap().take();
+                            let event = match request {
+                                Some(p) => match p.finish(&code, &mut crate::pairing::Store::load()).await {
+                                    Ok(id) => Ui::Paired(id),
+                                    Err(e) => Ui::PairFailed(format!("{e:#}")),
+                                },
+                                None => Ui::PairFailed("no pairing request open".into()),
+                            };
+                            let _ = proxy.send_event(event);
+                        });
+                    }
+                    Cmd::PairCancel => {
+                        state.pairing = None;
+                        pending.lock().unwrap().take();
+                    }
                     Cmd::Rescan => {
                         state.status = "Looking for receivers…".into();
                         rt.spawn(scan(proxy.clone()));
@@ -337,13 +404,17 @@ pub fn run() -> Result<()> {
             }
             Event::UserEvent(Ui::Devices(found)) => {
                 state.devices.clear();
+                let store = crate::pairing::Store::load();
                 for f in found {
                     if f.tv_app {
                         let name = format!("{} · TV app", f.name);
-                        state.devices.push(Device { name, addr: f.addr.clone(), direct: true });
+                        let paired = f.id.as_deref().is_some_and(|id| store.is_paired(id));
+                        let (addr, adb, id) = (f.addr.clone(), f.adb, f.id.clone());
+                        state.devices.push(Device { name, addr, direct: true, adb, id, paired });
                     }
                     if f.cast {
-                        state.devices.push(Device { name: f.name, addr: f.addr, direct: false });
+                        let device = Device { name: f.name, addr: f.addr, direct: false, adb: false, id: None, paired: false };
+                        state.devices.push(device);
                     }
                 }
                 if state.device().is_none() {
@@ -354,6 +425,31 @@ pub fn run() -> Result<()> {
                 state.screens = crate::capture::display_labels().inspect_err(|e| tracing::warn!("{e:#}")).unwrap_or_default();
                 if !casting {
                     state.status = if state.devices.is_empty() { "No receivers found" } else { "Ready" }.into();
+                }
+                changed = true;
+            }
+            Event::UserEvent(Ui::PairWaiting) => {
+                state.pair_error.clear();
+                changed = true;
+            }
+            Event::UserEvent(Ui::Paired(id)) => {
+                tracing::info!("paired with {id}");
+                for d in state.devices.iter_mut().filter(|d| d.id.as_deref() == Some(id.as_str())) {
+                    d.paired = true;
+                }
+                state.pairing = None;
+                state.pair_error.clear();
+                begin = true;
+                changed = true;
+            }
+            Event::UserEvent(Ui::PairFailed(error)) => {
+                tracing::warn!("pairing: {error}");
+                // A wrong code ends that request on our side: ask again, the device shows a fresh code.
+                if error.contains("wrong code") && let Some(device) = state.device() {
+                    start_pairing(&rt, device.addr.clone());
+                    state.pair_error = "Wrong code. The device shows a new one.".into();
+                } else {
+                    state.pair_error = error;
                 }
                 changed = true;
             }
@@ -400,6 +496,17 @@ pub fn run() -> Result<()> {
             state.status = "Restarting…".into();
         }
 
+        // An unpaired TV app that ADB can't start: pair first, casting begins once paired.
+        let unpaired = state.device().filter(|d| d.needs_pairing() && state.encrypt).map(|d| (d.name.clone(), d.addr.clone()));
+        if begin && stop.is_none() && let Some((name, addr)) = unpaired {
+            if state.pairing.is_none() {
+                state.pairing = Some(name);
+                state.pair_error = "Asking the device for a code…".into();
+                start_pairing(&rt, addr);
+            }
+            begin = false;
+            changed = true;
+        }
         if begin
             && stop.is_none()
             && let (Some(device), Some(what)) = (state.device(), state.target.clone())
@@ -560,7 +667,8 @@ async fn tv_app_installed(host: String) -> bool {
 }
 
 async fn scan(proxy: EventLoopProxy<Ui>) {
-    let found = match discover(Duration::from_secs(3)).await {
+    let (cast, announced) = tokio::join!(discover(Duration::from_secs(3)), crate::pairing::discover(Duration::from_secs(3)));
+    let found = match cast {
         Ok(found) => found,
         Err(e) => {
             let _ = proxy.send_event(Ui::Status(format!("Discovery failed: {e}")));
@@ -579,6 +687,8 @@ async fn scan(proxy: EventLoopProxy<Ui>) {
             addr: d.preferred_endpoint().address().to_string(),
             tv_app,
             cast: true,
+            adb: tv_app,
+            id: None,
         });
     }
     // Devices ADB already reaches over the network that run the app but aren't Cast receivers.
@@ -586,7 +696,26 @@ async fn scan(proxy: EventLoopProxy<Ui>) {
         let known = devices.iter().any(|d| d.addr.starts_with(&format!("{host}:")));
         if !known && tv_app_installed(host.clone()).await {
             let name = adb_name(&host).await;
-            devices.push(Found { name, addr: format!("{host}:{}", crate::direct::PORT), tv_app: true, cast: false });
+            let addr = format!("{host}:{}", crate::direct::PORT);
+            devices.push(Found { name, addr, tv_app: true, cast: false, adb: true, id: None });
+        }
+    }
+    // Apps announcing themselves: attach to a receiver at the same address, or list them on their own.
+    for app in announced.inspect_err(|e| tracing::warn!("app discovery: {e:#}")).unwrap_or_default() {
+        let prefix = format!("{}:", app.addr.ip());
+        match devices.iter_mut().find(|d| d.addr.starts_with(&prefix)) {
+            Some(d) => {
+                d.tv_app = true;
+                d.id = Some(app.id);
+            }
+            None => devices.push(Found {
+                name: app.name,
+                addr: app.addr.to_string(),
+                tv_app: true,
+                cast: false,
+                adb: false,
+                id: Some(app.id),
+            }),
         }
     }
     let _ = proxy.send_event(Ui::Devices(devices));

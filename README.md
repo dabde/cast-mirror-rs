@@ -180,6 +180,15 @@ menu bar app: switch off "Encrypt the stream", which then shows a warning) sends
 inspect them in Wireshark; anyone on the network can then watch the stream and inject frames.
 Cost: 24 bytes per packet (payload 1376 instead of 1400); fps unchanged in a 2 % loss test.
 
+**Without ADB:** the app announces itself on the network (`_castmirror._udp`) while it is open, so it also
+shows up in the menu bar window when no ADB connection exists (e.g. a phone after a restart). Pairing happens
+once: casting to an unpaired device asks for the code it shows (or `cast-mirror pair <ip>` in a terminal). Both
+sides do an ECDH P-256 exchange and mix the code into the result (PBKDF2, 100 000 rounds), so a man in the middle
+has to guess the code; each stores the resulting key (Mac: `~/Library/Application Support/CastMirror/paired.json`,
+mode 600; app: its preferences). Every later start proves the key both ways and derives a fresh session key in
+~0.1 s, without any input. `--direct` tries that first and falls back to starting the app over ADB; the app still
+has to be opened by hand without ADB, Android does not let the Mac start it. Details in `src/pairing.rs`.
+
 **Loss and congestion:** the app NACKs missing packets (and whole missing frames) and the sender
 resends them from a 120-frame history; a frame is only given up after 60 ms without progress while a later one is
 complete, then a key frame is requested (at most one per 500 ms). Every 100 ms the app reports received/expected

@@ -4,7 +4,11 @@ import android.app.Activity;
 import android.graphics.Color;
 import android.media.MediaCodec;
 import android.media.MediaFormat;
+import android.content.Context;
+import android.net.nsd.NsdManager;
+import android.net.nsd.NsdServiceInfo;
 import android.os.Build;
+import android.provider.Settings;
 import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
@@ -47,7 +51,9 @@ import java.util.TreeMap;
  *   expected u32, minimum one-way delay ms i32, frames given up u32, average first-packet-to-complete µs u32,
  *   average decoder µs u32; 'E' echoes a ping: timestamp u64.
  * Ping from the sender: "CP" | version | 0 | (counter |) timestamp u64, sealed like a packet.
- * Nonce: direction (0 to the app, 1 from it) | 0 0 0 | counter. The key comes with the start intent.
+ * Nonce: direction (0 to the app, 1 from it) | 0 0 0 | counter. The key comes with the start intent (ADB) or
+ * from a session handshake with a paired Mac ("CA" messages, see Pairing).
+ * The app announces itself as _castmirror._udp while the receiver runs.
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback, TextureView.SurfaceTextureListener {
     static final int PORT = 7010;
@@ -63,6 +69,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     static final String TAG = "CastMirror";
 
     private volatile boolean running;
+    private String deviceName;
+    private Pairing pairing;
+    private NsdManager nsd;
+    private NsdManager.RegistrationListener registration;
     // AES-128-GCM session key from the sender's `am start --es key`; ADB authenticated that sender.
     private SecretKeySpec key;
     // Started with `--ez plain true` (cast-mirror --no-encryption): v2 packets, no key.
@@ -107,10 +117,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
             }
             key = new SecretKeySpec(bytes, "AES");
         }
-        label.setText(key == null && !plain
-                ? "Cast Mirror receiver\n\nStart casting from the Mac:\nit starts this app with the session key."
-                : "Cast Mirror receiver\n" + localAddress() + ":" + PORT + "\n\nwaiting for cast-mirror --direct"
-                        + (plain ? "\n(unencrypted)" : ""));
+        deviceName = deviceName();
+        pairing = new Pairing(getSharedPreferences("castmirror", MODE_PRIVATE), deviceName, new Pairing.Listener() {
+            @Override
+            public void showCode(String mac, String code) {
+                runOnUiThread(() -> label.setText(code == null ? waitingText()
+                        : "Pairing with " + mac + "\n\nCode: " + code + "\n\nEnter it on the Mac."));
+            }
+
+            @Override
+            public void sessionKey(byte[] sessionKey) {
+                // Called on the receive thread, which is the only one using the key.
+                key = new SecretKeySpec(sessionKey, "AES");
+                plain = false;
+                sent = 0;
+            }
+        });
+        label.setText(waitingText());
         root.addView(label, new FrameLayout.LayoutParams(-1, -1));
         setContentView(root);
     }
@@ -125,10 +148,64 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
         start(new Surface(texture));
     }
 
-    private void start(Surface surface) {
-        if (key == null && !plain) {
-            return; // Without the key nothing would decrypt.
+    /** "HUAWEI P10" rather than "VTR-L09": the marketing name, else the user's device name, else make and model. */
+    private String deviceName() {
+        try {
+            // A system property apps can still read on Android 9; Huawei and others keep the retail name there.
+            String name = (String) Class.forName("android.os.SystemProperties")
+                    .getMethod("get", String.class).invoke(null, "ro.config.marketing_name");
+            if (name != null && !name.isEmpty()) {
+                return name;
+            }
+        } catch (Exception ignored) {
         }
+        String name = Settings.Global.getString(getContentResolver(), "device_name");
+        if (name != null && !name.isEmpty() && !name.equals(Build.MODEL)) {
+            return name;
+        }
+        return Build.MANUFACTURER + " " + Build.MODEL;
+    }
+
+    private String waitingText() {
+        String where = "Cast Mirror receiver\n" + deviceName + " · " + localAddress() + ":" + PORT;
+        if (plain) {
+            return where + "\n\nwaiting for cast-mirror --direct\n(unencrypted)";
+        }
+        return where + "\n\nPick \u201c" + deviceName + " \u00b7 TV app\u201d in Cast Mirror on your Mac.";
+    }
+
+    // Lets the Mac find the app without ADB while the receiver runs.
+    private void announce() {
+        NsdServiceInfo info = new NsdServiceInfo();
+        info.setServiceName(deviceName);
+        info.setServiceType("_castmirror._udp");
+        info.setPort(PORT);
+        info.setAttribute("id", pairing.deviceIdHex());
+        info.setAttribute("name", deviceName);
+        nsd = (NsdManager) getSystemService(Context.NSD_SERVICE);
+        registration = new NsdManager.RegistrationListener() {
+            @Override
+            public void onServiceRegistered(NsdServiceInfo i) {
+                Log.i(TAG, "announced as " + i.getServiceName());
+            }
+
+            @Override
+            public void onRegistrationFailed(NsdServiceInfo i, int error) {
+                Log.w(TAG, "announcing failed: " + error);
+            }
+
+            @Override
+            public void onServiceUnregistered(NsdServiceInfo i) {}
+
+            @Override
+            public void onUnregistrationFailed(NsdServiceInfo i, int error) {}
+        };
+        nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, registration);
+    }
+
+    private void start(Surface surface) {
+        // Without a key the receiver still runs: a paired Mac brings one over the network.
+        announce();
         running = true;
         receiver = new Thread(() -> receive(surface), "receiver");
         receiver.start();
@@ -155,6 +232,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     }
 
     private void stop() {
+        if (registration != null) {
+            nsd.unregisterService(registration);
+            registration = null;
+        }
         running = false;
         if (receiver != null) {
             try {
@@ -263,6 +344,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                 // silent for 300 ms (a restart), so two concurrent senders don't ping-pong the decoder.
                 boolean foreign = got && sender != null && !sender.equals(packet.getSocketAddress())
                         && now - lastPacket < 300;
+                if (got && n >= 3 && buf[0] == 'C' && buf[1] == 'A') {
+                    // Pairing and session start: replies go back unsealed, the handshake protects itself.
+                    byte[] reply = pairing.handle(buf, n);
+                    if (reply != null) {
+                        socket.send(new DatagramPacket(reply, reply.length, packet.getSocketAddress()));
+                    }
+                    continue;
+                }
                 int payload = -1;
                 if (got && !foreign && n >= HEADER && buf[0] == 'C' && buf[1] == 'M') {
                     payload = payload(buf, n, HEADER);
