@@ -144,7 +144,9 @@ Android's KEY_LOW_LATENCY but accepts MediaTek's `vdec-lowlatency`.
 **Encryption (protocol v3):** every packet in both directions is AES-128-GCM sealed: payload encrypted,
 header authenticated, a counter per packet as nonce, so resends get fresh nonces. The key is random per session
 and reaches the app with the start intent over ADB, which the TV authenticated when it accepted this Mac; that is
-why `--direct` now starts the app itself. Started by hand without a key, the app only asks to cast from the Mac.
+why `--direct` now starts the app itself. Started by hand without a key, the app only asks to cast from the Mac. `--no-encryption` (in the
+menu bar app: switch off "Encrypt the stream", which then shows a warning) sends v2 packets in the clear, e.g. to
+inspect them in Wireshark; anyone on the network can then watch the stream and inject frames.
 Cost: 24 bytes per packet (payload 1376 instead of 1400); fps unchanged in a 2 % loss test.
 
 **Loss and congestion:** the app NACKs missing packets (and whole missing frames) and the sender

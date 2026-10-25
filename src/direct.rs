@@ -17,7 +17,7 @@ use anyhow::{bail, Context, Result};
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_128_GCM};
 use ring::rand::SecureRandom;
 use tokio::net::UdpSocket;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::capture::{self, Capture, LatestFrame};
 use crate::mirror::{Control, VideoEncoder};
@@ -50,15 +50,21 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
         .parse()
         .or_else(|_| format!("{device}:{PORT}").parse())
         .with_context(|| format!("not an address: {device}"))?;
-    let mut key = [0u8; 16];
-    ring::rand::SystemRandom::new().fill(&mut key).map_err(|_| anyhow::anyhow!("no system randomness"))?;
+    let key = if args.no_encryption {
+        warn!("direct mode UNENCRYPTED: anyone on the network can watch the stream and inject frames");
+        None
+    } else {
+        let mut key = [0u8; 16];
+        ring::rand::SystemRandom::new().fill(&mut key).map_err(|_| anyhow::anyhow!("no system randomness"))?;
+        Some(key)
+    };
     (control.status)("Starting the TV app over ADB…".into());
+    let hex = key.map(|k| k.iter().map(|b| format!("{b:02x}")).collect::<String>());
     // The TV's graphics plane is 1080p: above that, use the (slower) 4K video plane.
-    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-    start_tv_app(&addr.ip().to_string(), args.width <= 1920, &hex).await?;
+    start_tv_app(&addr.ip().to_string(), args.width <= 1920, hex.as_deref()).await?;
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.connect(addr).await?;
-    let mut link = Link::new(socket, Crypto::new(&key));
+    let mut link = Link::new(socket, key.map(|k| Crypto::new(&k)));
 
     let codec = args.codecs.first().copied().unwrap_or(Codec::H264);
     let hevc = codec == Codec::Hevc;
@@ -101,7 +107,13 @@ pub async fn run(args: MirrorArgs, control: Control) -> Result<()> {
                 // ECONNREFUSED here just means the app isn't listening yet.
                 let Ok(n) = r else { continue };
                 // Anything that doesn't decrypt is not from our app (or was altered on the way).
-                let Some(msg) = link.crypto.open(&mut feedback[..n], 0, FROM_APP) else { continue };
+                let msg = match &link.crypto {
+                    Some(crypto) => match crypto.open(&mut feedback[..n], 0, FROM_APP) {
+                        Some(msg) => msg,
+                        None => continue,
+                    },
+                    None => &feedback[..n],
+                };
                 let n = msg.len();
                 match *msg {
                     // The app repeats 'K' every 200 ms until a key frame lands; one per 500 ms is enough,
@@ -231,14 +243,15 @@ fn packetize(id: u32, flags: u8, seq: &mut u32, sent_ms: u32, data: &[u8]) -> Ve
 /// router in front of a slow link, while capture and encoding go on.
 struct Link {
     socket: Arc<UdpSocket>,
-    crypto: Crypto,
+    // None with --no-encryption.
+    crypto: Option<Crypto>,
     drop: f64,
     paced: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
     rng: u64,
 }
 
 impl Link {
-    fn new(socket: UdpSocket, crypto: Crypto) -> Self {
+    fn new(socket: UdpSocket, crypto: Option<Crypto>) -> Self {
         let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
         let socket = Arc::new(socket);
         let cap_bps = env("CAST_MIRROR_CAP_KBPS") * 1000.0;
@@ -260,7 +273,7 @@ impl Link {
 
     /// Encrypts on every send, resends included: their flags differ, so they need a fresh nonce.
     async fn send(&mut self, packet: &[u8]) {
-        let packet = &self.crypto.seal(packet, HEADER, TO_APP)[..];
+        let packet = &wire(self.crypto.as_mut(), packet)[..];
         if self.drop > 0.0 {
             // xorshift: cheap and good enough for a loss simulation.
             self.rng ^= self.rng << 13;
@@ -277,6 +290,18 @@ impl Link {
             None => {
                 let _ = self.socket.send(packet).await;
             }
+        }
+    }
+}
+
+/// What goes on the wire: sealed (v3), or with `--no-encryption` the packet as it is, marked v2.
+fn wire(crypto: Option<&mut Crypto>, packet: &[u8]) -> Vec<u8> {
+    match crypto {
+        Some(crypto) => crypto.seal(packet, HEADER, TO_APP),
+        None => {
+            let mut plain = packet.to_vec();
+            plain[2] = 2;
+            plain
         }
     }
 }
@@ -332,15 +357,19 @@ impl Crypto {
 
 /// (Re)starts the receiver app (android/) over ADB; network debugging must be enabled on the TV.
 /// `gpu`: draw on the graphics plane (fast, 1080p max) instead of the video plane (4K, ~85 ms slower).
-/// `key`: the session's AES key, in hex; ADB is authenticated, so it reaches only this TV.
-async fn start_tv_app(host: &str, gpu: bool, key: &str) -> Result<()> {
+/// `key`: the session's AES key, in hex; ADB is authenticated, so it reaches only this TV. None: unencrypted.
+async fn start_tv_app(host: &str, gpu: bool, key: Option<&str>) -> Result<()> {
     let serial = format!("{host}:5555");
     let ten = Duration::from_secs(10);
     adb(&["connect", &serial], ten).await.context("running adb (brew install --cask android-platform-tools)")?;
     // -S restarts the activity, so a changed plane choice takes effect.
     let texture = gpu.to_string();
     let activity = format!("{TV_APP}/.MainActivity");
-    let args = ["-s", &serial, "shell", "am", "start", "-S", "-n", &activity, "--ez", "texture", &texture, "--es", "key", key];
+    let mut args = vec!["-s", &serial, "shell", "am", "start", "-S", "-n", &activity, "--ez", "texture", &texture];
+    args.extend(match key {
+        Some(key) => ["--es", "key", key],
+        None => ["--ez", "plain", "true"],
+    });
     let out = adb(&args, ten).await?;
     let text = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     if !out.status.success() || text.contains("Error") {
@@ -542,6 +571,15 @@ mod tests {
         assert_eq!(&packets[0][..HEADER], &[b'C', b'M', 3, 3, 1, 2, 3, 4, 0, 0, 0, 2, 0, 0, 0, 42, 10, 11, 12, 13]);
         assert_eq!(&packets[1][8..16], &[0, 1, 0, 2, 0, 0, 0, 43]);
         assert_eq!(packets[0].len() + packets[1].len() - 2 * HEADER, data.len());
+    }
+
+    #[test]
+    fn unencrypted_packets_go_out_unchanged_as_v2() {
+        let packet = packetize(1, 0, &mut 0, 0, &[5u8; 10]).remove(0);
+        let plain = wire(None, &packet);
+        assert_eq!(plain[2], 2);
+        assert_eq!(plain[3..], packet[3..]);
+        assert_eq!(wire(Some(&mut Crypto::new(&[1; 16])), &packet)[2], 3);
     }
 
     #[test]

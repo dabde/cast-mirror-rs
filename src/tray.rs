@@ -71,6 +71,7 @@ enum Cmd {
     Profile { index: usize },
     Audio { on: bool },
     Mute { on: bool },
+    Encrypt { on: bool },
     Rescan,
     Relaunch,
     Quit,
@@ -116,6 +117,8 @@ struct State {
     target: Option<Target>,
     audio: bool,
     mute: bool,
+    // Direct mode only; off sends the TV app stream unencrypted.
+    encrypt: bool,
 }
 
 impl State {
@@ -136,6 +139,7 @@ impl State {
             "profile": self.profile,
             "audio": self.audio,
             "mute": self.mute,
+            "encrypt": self.encrypt,
         })
         .to_string()
     }
@@ -195,6 +199,7 @@ pub fn run() -> Result<()> {
         target: None,
         audio: true,
         mute: false,
+        encrypt: true,
     };
     let mut tray: Option<TrayIcon> = None;
     let mut tray_menu = Some(menu);
@@ -310,6 +315,10 @@ pub fn run() -> Result<()> {
                         restart = casting;
                     }
                     Cmd::Mute { on } => state.mute = on,
+                    Cmd::Encrypt { on } => {
+                        state.encrypt = on;
+                        restart = casting && state.device().is_some_and(|d| d.direct);
+                    }
                     Cmd::Rescan => {
                         state.status = "Looking for receivers…".into();
                         rt.spawn(scan(proxy.clone()));
@@ -389,6 +398,7 @@ pub fn run() -> Result<()> {
             args.bitrate = profile.bitrate;
             args.auto = profile.auto;
             args.no_audio = !state.audio;
+            args.no_encryption = !state.encrypt;
             match &what {
                 Target::Display(i, _) => args.display = *i,
                 Target::Window(id, _) => args.window = Some(id.to_string()),

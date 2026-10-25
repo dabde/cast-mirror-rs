@@ -58,6 +58,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     private volatile boolean running;
     // AES-128-GCM session key from the sender's `am start --es key`; ADB authenticated that sender.
     private SecretKeySpec key;
+    // Started with `--ez plain true` (cast-mirror --no-encryption): v2 packets, no key.
+    private boolean plain;
     private Cipher opener;
     private Cipher sealer;
     private long sent;
@@ -87,6 +89,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
         label.setBackgroundColor(Color.BLACK); // Covers the last frame once the sender is gone.
         label.setTextSize(28);
         label.setGravity(Gravity.CENTER);
+        plain = getIntent().getBooleanExtra("plain", false);
         String hex = getIntent().getStringExtra("key");
         if (hex != null && hex.length() == 32) {
             byte[] bytes = new byte[16];
@@ -95,9 +98,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
             }
             key = new SecretKeySpec(bytes, "AES");
         }
-        label.setText(key == null
+        label.setText(key == null && !plain
                 ? "Cast Mirror receiver\n\nStart casting from the Mac:\nit starts this app with the session key."
-                : "Cast Mirror receiver\n" + localAddress() + ":" + PORT + "\n\nwaiting for cast-mirror --direct");
+                : "Cast Mirror receiver\n" + localAddress() + ":" + PORT + "\n\nwaiting for cast-mirror --direct"
+                        + (plain ? "\n(unencrypted)" : ""));
         root.addView(label, new FrameLayout.LayoutParams(-1, -1));
         setContentView(root);
     }
@@ -113,7 +117,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     }
 
     private void start(Surface surface) {
-        if (key == null) {
+        if (key == null && !plain) {
             return; // Without the key nothing would decrypt.
         }
         running = true;
@@ -161,6 +165,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
     // Feedback is best effort: a failed send (e.g. Wi-Fi briefly gone) must not end the receive loop.
     private void send(DatagramSocket socket, byte[] data, int length, SocketAddress to) {
         try {
+            if (plain) {
+                socket.send(new DatagramPacket(data, length, to));
+                return;
+            }
             long counter = sent++;
             byte[] out = new byte[COUNTER + length + GCM_TAG];
             ByteBuffer.wrap(out).putLong(counter);
@@ -238,12 +246,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback, Te
                 // silent for 300 ms (a restart), so two concurrent senders don't ping-pong the decoder.
                 boolean foreign = got && sender != null && !sender.equals(packet.getSocketAddress())
                         && now - lastPacket < 300;
-                int plain = -1;
-                if (got && !foreign && n >= HEADER && buf[0] == 'C' && buf[1] == 'M' && buf[2] == 3) {
-                    plain = open(buf, n);
+                int payload = -1;
+                if (got && !foreign && n >= HEADER && buf[0] == 'C' && buf[1] == 'M') {
+                    if (buf[2] == 3 && key != null) {
+                        payload = open(buf, n);
+                    } else if (buf[2] == 2 && plain) {
+                        payload = n - HEADER;
+                    }
                 }
-                if (plain >= 0) {
-                    n = HEADER + plain;
+                if (payload >= 0) {
+                    n = HEADER + payload;
                     sender = packet.getSocketAddress();
                     lastPacket = now;
                     int flags = buf[3];

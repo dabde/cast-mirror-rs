@@ -130,6 +130,13 @@
   }
   .switch.on { background: #30d158; }
   .switch.on::after { left: 16px; }
+  .warning {
+    display: none;
+    color: var(--danger);
+    font-size: 11px;
+    padding: 0 6px 4px;
+  }
+  .warning.on { display: block; }
   footer {
     display: flex;
     gap: 4px;
@@ -170,6 +177,10 @@
   <h2><span>AUDIO</span></h2>
   <div class="toggle" onclick="toggle('audio')"><span class="label">Send audio</span><div class="switch" id="audio"></div></div>
   <div class="toggle" onclick="toggle('mute')"><span class="label">Mute Mac while casting</span><div class="switch" id="mute"></div></div>
+
+  <h2><span>TV APP</span></h2>
+  <div class="toggle" onclick="toggle('encrypt')"><span class="label">Encrypt the stream</span><div class="switch" id="encrypt"></div></div>
+  <div class="warning" id="plain">Unencrypted: anyone on your network can watch the stream and inject frames.</div>
 
   <footer>
     <button onclick="send({cmd: 'relaunch'})"><span class="i" style="--i: url(app://localhost/icon/arrow.triangle.2.circlepath)"></span>Restart app</button>
@@ -242,6 +253,8 @@
 
     document.getElementById("audio").classList.toggle("on", s.audio);
     document.getElementById("mute").classList.toggle("on", s.mute);
+    document.getElementById("encrypt").classList.toggle("on", s.encrypt);
+    document.getElementById("plain").classList.toggle("on", !s.encrypt);
     send({cmd: "height", px: document.getElementById("panel").offsetHeight});
   }
 

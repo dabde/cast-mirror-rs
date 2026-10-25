@@ -80,6 +80,9 @@ pub struct MirrorArgs {
     /// Stream to the cast-mirror Android TV app (android/) at DEVICE's IP instead of Cast.
     #[arg(long)]
     pub direct: bool,
+    /// Direct mode: send unencrypted. Anyone on the network can then watch the stream and inject frames.
+    #[arg(long)]
+    pub no_encryption: bool,
     /// Direct mode: step resolution and frame rate down (and back up) with the Wi-Fi quality.
     #[arg(long)]
     pub auto: bool,
