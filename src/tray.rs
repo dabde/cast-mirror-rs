@@ -1,23 +1,30 @@
-//! Menu-bar app: pick a receiver and a profile, start and stop casting.
+//! Menu-bar app: a click on the icon opens a small window (a web view, `ui.html`) to pick what to cast,
+//! the receiver and a profile; a right click offers Restart app and Quit.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
 use chromiacast::discover;
 use clap::Parser;
-use tao::event::{Event, StartCause};
+use serde::Deserialize;
+use tao::dpi::{LogicalSize, PhysicalPosition};
+use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+use tao::window::WindowBuilder;
 use tokio::sync::watch;
-use tray_icon::menu::{CheckMenuItem, IconMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use wry::{WebView, WebViewBuilder};
 
 use crate::mirror::{self, Control, Source};
 use crate::Cli;
 
 struct Profile {
-    label: &'static str,
+    name: &'static str,
+    detail: &'static str,
     delay: u64,
     fps: u32,
     width: u32,
@@ -27,24 +34,46 @@ struct Profile {
 
 // Measured on a Philips TPM191E and a Chromecast on its HDMI input; see README.
 const PROFILES: [Profile; 6] = [
-    Profile { label: "Lowest latency (Chromecast, 60 ms)", delay: 60, fps: 30, width: 1920, bitrate: 6_000_000, auto: false },
-    Profile { label: "Balanced (100 ms)", delay: 100, fps: 30, width: 1920, bitrate: 6_000_000, auto: false },
-    Profile { label: "TV built-in Cast (150 ms)", delay: 150, fps: 30, width: 1920, bitrate: 6_000_000, auto: false },
-    Profile { label: "Smooth video (200 ms, 60 fps)", delay: 200, fps: 60, width: 1920, bitrate: 8_000_000, auto: false },
+    Profile { name: "Lowest latency", detail: "Chromecast, 60 ms buffer", delay: 60, fps: 30, width: 1920, bitrate: 6_000_000, auto: false },
+    Profile { name: "Balanced", detail: "100 ms buffer", delay: 100, fps: 30, width: 1920, bitrate: 6_000_000, auto: false },
+    Profile { name: "TV built-in Cast", detail: "150 ms, its lowest", delay: 150, fps: 30, width: 1920, bitrate: 6_000_000, auto: false },
+    Profile { name: "Smooth video", detail: "200 ms, 60 fps", delay: 200, fps: 60, width: 1920, bitrate: 8_000_000, auto: false },
     // Few frames, many bits each: sharp 4K text; motion looks jerky.
-    Profile { label: "Presentation (4K, 10 fps, sharp)", delay: 200, fps: 10, width: 3840, bitrate: 12_000_000, auto: false },
+    Profile { name: "Presentation", detail: "4K, 10 fps, sharp text", delay: 200, fps: 10, width: 3840, bitrate: 12_000_000, auto: false },
     // Direct mode only: steps 1080p60 → 540p30 with the Wi-Fi quality and back.
-    Profile { label: "Auto (adapts to Wi-Fi, direct mode)", delay: 100, fps: 60, width: 1920, bitrate: 6_000_000, auto: true },
+    Profile { name: "Auto", detail: "TV app: adapts to the Wi-Fi", delay: 100, fps: 60, width: 1920, bitrate: 6_000_000, auto: true },
 ];
 const DEFAULT_PROFILE: usize = 1;
+const WIDTH: f64 = 320.0;
 
 enum Ui {
     Menu(MenuEvent),
+    Tray(TrayIconEvent),
+    Js(String),
     Devices(Vec<Found>),
     Status(String),
     Stopped(Option<String>),
     // Picked in the macOS window picker: id and "app: title".
     Window(u32, String),
+}
+
+/// Commands from `ui.html`.
+#[derive(Deserialize)]
+#[serde(tag = "cmd", rename_all = "camelCase")]
+enum Cmd {
+    Ready,
+    Height { px: f64 },
+    Hide,
+    CastScreen { index: usize },
+    CastWindow,
+    Stop,
+    Receiver { name: String },
+    Profile { index: usize },
+    Audio { on: bool },
+    Mute { on: bool },
+    Rescan,
+    Relaunch,
+    Quit,
 }
 
 /// A Cast receiver from discovery; `tv_app`: our receiver app (android/) is installed, reachable over ADB.
@@ -54,9 +83,8 @@ struct Found {
     tv_app: bool,
 }
 
-/// One "Receiver" entry: a Cast receiver, or its TV app (direct mode).
+/// A receiver entry: a Cast receiver, or its TV app (direct mode).
 struct Device {
-    item: CheckMenuItem,
     name: String,
     addr: String,
     direct: bool,
@@ -78,50 +106,42 @@ impl Target {
     }
 }
 
-/// "Cast screen": one item for one display, a submenu to pick from when there are more.
-struct Screens {
-    single: IconMenuItem,
-    submenu: Submenu,
-    items: Vec<IconMenuItem>,
-    labels: Vec<String>,
+/// Everything the window shows; `view()` hands it to `render()` in ui.html.
+struct State {
+    status: String,
+    devices: Vec<Device>,
+    selected: Option<String>,
+    screens: Vec<String>,
+    profile: usize,
+    target: Option<Target>,
+    audio: bool,
+    mute: bool,
 }
 
-impl Screens {
-    const POSITION: usize = 2;
-
-    fn refresh(&mut self, menu: &Menu) {
-        self.labels = crate::capture::display_labels()
-            .inspect_err(|e| tracing::warn!("{e:#}"))
-            .unwrap_or_default();
-        for item in self.items.drain(..) {
-            let _ = self.submenu.remove(&item);
-        }
-        let _ = menu.remove(&self.single);
-        let _ = menu.remove(&self.submenu);
-        if self.labels.len() > 1 {
-            for label in &self.labels {
-                let item = icon_item(label, true, if label.starts_with("Built-in") { "laptopcomputer" } else { "display" });
-                let _ = self.submenu.append(&item);
-                self.items.push(item);
-            }
-            let _ = menu.insert(&self.submenu, Self::POSITION);
-        } else {
-            let _ = menu.insert(&self.single, Self::POSITION);
-        }
+impl State {
+    fn view(&self, casting: bool) -> String {
+        let source = match &self.target {
+            Some(Target::Display(..)) => "screen",
+            Some(Target::Window(..)) => "window",
+            None => "",
+        };
+        serde_json::json!({
+            "status": self.status,
+            "casting": casting,
+            "source": source,
+            "receivers": self.devices.iter().map(|d| serde_json::json!({"name": d.name, "direct": d.direct})).collect::<Vec<_>>(),
+            "selected": self.selected,
+            "screens": self.screens,
+            "profiles": PROFILES.iter().map(|p| serde_json::json!({"name": p.name, "detail": p.detail})).collect::<Vec<_>>(),
+            "profile": self.profile,
+            "audio": self.audio,
+            "mute": self.mute,
+        })
+        .to_string()
     }
 
-    /// The display a menu event picked, if it was one of ours.
-    fn picked(&self, id: &tray_icon::menu::MenuId) -> Option<Target> {
-        let label = |i: usize| self.labels.get(i).cloned().unwrap_or_else(|| format!("{}", i + 1));
-        if id == self.single.id() {
-            return Some(Target::Display(0, label(0)));
-        }
-        self.items.iter().position(|item| id == item.id()).map(|i| Target::Display(i, label(i)))
-    }
-
-    fn set_enabled(&self, enabled: bool) {
-        self.single.set_enabled(enabled);
-        self.submenu.set_enabled(enabled);
+    fn device(&self) -> Option<&Device> {
+        self.devices.iter().find(|d| Some(&d.name) == self.selected.as_ref())
     }
 }
 
@@ -130,71 +150,76 @@ pub fn run() -> Result<()> {
     let mut event_loop = EventLoopBuilder::<Ui>::with_user_event().build();
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
     let proxy = event_loop.create_proxy();
-    let menu_proxy = proxy.clone();
+    let p = proxy.clone();
     MenuEvent::set_event_handler(Some(move |e| {
-        let _ = menu_proxy.send_event(Ui::Menu(e));
+        let _ = p.send_event(Ui::Menu(e));
+    }));
+    let p = proxy.clone();
+    TrayIconEvent::set_event_handler(Some(move |e| {
+        let _ = p.send_event(Ui::Tray(e));
     }));
 
-    let status = MenuItem::new("Looking for receivers…", false, None);
-    let mut screens = Screens {
-        single: icon_item("Cast screen", false, "display"),
-        submenu: Submenu::new("Cast screen", false),
-        items: Vec::new(),
-        labels: Vec::new(),
-    };
-    screens.submenu.set_icon_templated(symbol("display"));
-    let cast_window = icon_item("Cast window…", false, "macwindow");
-    let stop_item = icon_item("Stop casting", false, "stop.circle");
-    let receivers = Submenu::new("Receiver", true);
-    receivers.set_icon_templated(symbol("tv"));
-    let rescan = icon_item("Rescan", true, "arrow.clockwise");
-    receivers.append_items(&[&PredefinedMenuItem::separator(), &rescan])?;
-    let profiles: Vec<CheckMenuItem> = PROFILES
-        .iter()
-        .enumerate()
-        .map(|(i, p)| CheckMenuItem::new(p.label, true, i == DEFAULT_PROFILE, None))
-        .collect();
-    let audio = CheckMenuItem::new("Audio", true, true, None);
-    // ScreenCaptureKit records the apps' audio before the output volume, so the TV still gets all of it.
-    let mute = CheckMenuItem::new("Mute Mac while casting", true, false, None);
-    // macOS applies a newly granted Screen Recording permission only to a fresh process.
-    let relaunch = icon_item("Restart app", true, "arrow.triangle.2.circlepath");
-    let quit = icon_item("Quit", true, "power");
+    // Right click: what's needed even when the window misbehaves.
+    let relaunch = MenuItem::new("Restart app", true, None);
+    let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
-    menu.append_items(&[&status, &PredefinedMenuItem::separator(), &cast_window, &stop_item, &receivers])?;
-    menu.append(&PredefinedMenuItem::separator())?;
-    for p in &profiles {
-        menu.append(p)?;
-    }
-    menu.append_items(&[&PredefinedMenuItem::separator(), &audio, &mute])?;
-    menu.append_items(&[&PredefinedMenuItem::separator(), &relaunch, &quit])?;
-    screens.refresh(&menu);
+    menu.append_items(&[&relaunch, &quit])?;
+
+    let window = WindowBuilder::new()
+        .with_title("Cast Mirror")
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_resizable(false)
+        .with_always_on_top(true)
+        .with_visible(false)
+        .with_inner_size(LogicalSize::new(WIDTH, 480.0))
+        .build(&event_loop)?;
+    let p = proxy.clone();
+    let webview = WebViewBuilder::new()
+        .with_transparent(true)
+        .with_custom_protocol("app".into(), serve)
+        .with_ipc_handler(move |req| {
+            let _ = p.send_event(Ui::Js(req.into_body()));
+        })
+        .with_url("app://localhost/")
+        .build(&window)?;
 
     rt.spawn(scan(proxy.clone()));
 
+    let mut state = State {
+        status: "Looking for receivers…".into(),
+        devices: Vec::new(),
+        selected: None,
+        screens: Vec::new(),
+        profile: DEFAULT_PROFILE,
+        target: None,
+        audio: true,
+        mute: false,
+    };
     let mut tray: Option<TrayIcon> = None;
-    let mut devices: Vec<Device> = Vec::new();
-    let mut selected: Option<String> = None;
-    let mut profile = DEFAULT_PROFILE;
-    let mut target: Option<Target> = None;
+    let mut tray_menu = Some(menu);
     let mut stop: Option<watch::Sender<bool>> = None;
     let (mut restart, mut quitting) = (false, false);
     // Set when we muted the Mac, so stopping restores exactly what the user had.
     let mut muted_by_us = false;
-    let mut tray_menu = Some(menu.clone());
 
     event_loop.run(move |event, _, flow| {
         *flow = ControlFlow::Wait;
         let casting = stop.is_some();
         let mut begin = false;
-        // A new target starts casting, or restarts a running session with it.
-        let mut cast = |t: Target, begin: &mut bool, restart: &mut bool| {
-            tracing::info!("menu: cast {}", t.label());
-            target = Some(t);
-            if casting {
-                *restart = true;
-            } else {
-                *begin = true;
+        let mut changed = false;
+        // Quit or Restart app: stop the session first so the receiver gets its STOP.
+        let leave = |relaunch: bool, flow: &mut ControlFlow, quitting: &mut bool, status: &mut String| {
+            if relaunch && let Err(err) = relaunch_after_exit() {
+                *status = format!("Restart failed: {err:#}");
+                return;
+            }
+            match &stop {
+                Some(tx) => {
+                    *quitting = true;
+                    let _ = tx.send(true);
+                }
+                None => *flow = ControlFlow::Exit,
             }
         };
         match event {
@@ -202,6 +227,7 @@ pub fn run() -> Result<()> {
             Event::NewEvents(StartCause::Init) => {
                 tray = TrayIconBuilder::new()
                     .with_menu(Box::new(tray_menu.take().unwrap()))
+                    .with_menu_on_left_click(false)
                     .with_icon_templated(icon(false))
                     .with_tooltip("Cast Mirror")
                     .build()
@@ -209,35 +235,126 @@ pub fn run() -> Result<()> {
                     .ok();
                 tracing::info!("tray icon created: {}", tray.is_some());
             }
-            Event::UserEvent(Ui::Devices(found)) => {
-                for d in devices.drain(..) {
-                    let _ = receivers.remove(&d.item);
-                }
-                for f in found {
-                    let tv_app = f.tv_app.then(|| format!("{} · TV app (lowest latency)", f.name));
-                    devices.push(Device { item: CheckMenuItem::new(&f.name, true, false, None), name: f.name, addr: f.addr.clone(), direct: false });
-                    if let Some(name) = tv_app {
-                        devices.push(Device { item: CheckMenuItem::new(&name, true, false, None), name, addr: f.addr, direct: true });
-                    }
-                }
-                if selected.as_ref().is_none_or(|s| !devices.iter().any(|d| &d.name == s)) {
-                    selected = devices.first().map(|d| d.name.clone());
-                }
-                for (i, d) in devices.iter().enumerate() {
-                    d.item.set_checked(Some(&d.name) == selected.as_ref());
-                    let _ = receivers.insert(&d.item, i);
-                }
-                // Displays come and go like receivers; refresh both on every scan.
-                screens.refresh(&menu);
-                if !casting {
-                    status.set_text(if devices.is_empty() { "No receivers found" } else { "Ready" });
+            Event::UserEvent(Ui::Tray(TrayIconEvent::Click {
+                rect,
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            })) => {
+                if window.is_visible() {
+                    window.set_visible(false);
+                } else {
+                    // Centered under the icon, like a system popover.
+                    let width = WIDTH * window.scale_factor();
+                    let x = rect.position.x + rect.size.width as f64 / 2.0 - width / 2.0;
+                    window.set_outer_position(PhysicalPosition::new(x, rect.position.y + rect.size.height as f64 + 4.0));
+                    window.set_visible(true);
+                    window.set_focus();
                 }
             }
-            Event::UserEvent(Ui::Status(text)) => status.set_text(text),
-            Event::UserEvent(Ui::Window(id, title)) => cast(Target::Window(id, title), &mut begin, &mut restart),
+            Event::WindowEvent { event: WindowEvent::Focused(false), .. } => window.set_visible(false),
+            Event::UserEvent(Ui::Menu(e)) => {
+                if e.id == *quit.id() || e.id == *relaunch.id() {
+                    leave(e.id == *relaunch.id(), flow, &mut quitting, &mut state.status);
+                }
+            }
+            Event::UserEvent(Ui::Js(body)) => {
+                let cmd = match serde_json::from_str::<Cmd>(&body) {
+                    Ok(cmd) => cmd,
+                    Err(e) => return tracing::warn!("ui: {e}: {body}"),
+                };
+                changed = true;
+                let mut cast = |t: Target| {
+                    tracing::info!("cast {}", t.label());
+                    state.target = Some(t);
+                    if casting {
+                        restart = true;
+                    } else {
+                        begin = true;
+                    }
+                };
+                match cmd {
+                    Cmd::Ready => {}
+                    Cmd::Height { px } => {
+                        window.set_inner_size(LogicalSize::new(WIDTH, px));
+                        changed = false;
+                    }
+                    Cmd::Hide => window.set_visible(false),
+                    Cmd::CastScreen { index } => {
+                        let name = state.screens.get(index).cloned().unwrap_or_else(|| "1".into());
+                        cast(Target::Display(index, name));
+                    }
+                    Cmd::CastWindow => {
+                        window.set_visible(false);
+                        show_window_picker(proxy.clone());
+                    }
+                    Cmd::Stop => {
+                        if let Some(tx) = &stop {
+                            tracing::info!("stop");
+                            let _ = tx.send(true);
+                            // An explicit stop wins over a restart queued by an earlier settings change.
+                            restart = false;
+                            state.status = "Stopping…".into();
+                        }
+                    }
+                    Cmd::Receiver { name } => {
+                        state.selected = Some(name);
+                        restart = casting;
+                    }
+                    Cmd::Profile { index } => {
+                        state.profile = index.min(PROFILES.len() - 1);
+                        restart = casting;
+                    }
+                    Cmd::Audio { on } => {
+                        state.audio = on;
+                        restart = casting;
+                    }
+                    Cmd::Mute { on } => state.mute = on,
+                    Cmd::Rescan => {
+                        state.status = "Looking for receivers…".into();
+                        rt.spawn(scan(proxy.clone()));
+                    }
+                    Cmd::Relaunch | Cmd::Quit => {
+                        leave(matches!(cmd, Cmd::Relaunch), flow, &mut quitting, &mut state.status)
+                    }
+                }
+            }
+            Event::UserEvent(Ui::Devices(found)) => {
+                state.devices.clear();
+                for f in found {
+                    if f.tv_app {
+                        let name = format!("{} · TV app", f.name);
+                        state.devices.push(Device { name, addr: f.addr.clone(), direct: true });
+                    }
+                    state.devices.push(Device { name: f.name, addr: f.addr, direct: false });
+                }
+                if state.device().is_none() {
+                    state.selected = state.devices.iter().find(|d| !d.direct).map(|d| d.name.clone());
+                }
+                // Displays come and go like receivers; refresh both on every scan.
+                state.screens = crate::capture::display_labels().inspect_err(|e| tracing::warn!("{e:#}")).unwrap_or_default();
+                if !casting {
+                    state.status = if state.devices.is_empty() { "No receivers found" } else { "Ready" }.into();
+                }
+                changed = true;
+            }
+            Event::UserEvent(Ui::Status(text)) => {
+                state.status = text;
+                changed = true;
+            }
+            Event::UserEvent(Ui::Window(id, title)) => {
+                tracing::info!("cast window {title}");
+                state.target = Some(Target::Window(id, title));
+                if casting {
+                    restart = true;
+                } else {
+                    begin = true;
+                }
+                changed = true;
+            }
             Event::UserEvent(Ui::Stopped(error)) => {
                 stop = None;
-                status.set_text(error.as_deref().unwrap_or("Stopped"));
+                state.status = error.unwrap_or_else(|| "Stopped".into());
                 if let Some(t) = &tray {
                     let _ = t.set_icon_templated(Some(icon(false)));
                 }
@@ -250,82 +367,33 @@ pub fn run() -> Result<()> {
                 if begin {
                     tracing::info!("restarting with changed settings");
                 }
-            }
-            Event::UserEvent(Ui::Menu(e)) => {
-                if let Some(t) = screens.picked(&e.id) {
-                    cast(t, &mut begin, &mut restart);
-                } else if e.id == *cast_window.id() {
-                    show_window_picker(proxy.clone());
-                } else if e.id == *stop_item.id() {
-                    if let Some(tx) = &stop {
-                        tracing::info!("menu: stop");
-                        let _ = tx.send(true);
-                        // An explicit stop wins over a restart queued by an earlier settings change.
-                        restart = false;
-                        status.set_text("Stopping…");
-                    }
-                } else if e.id == *quit.id() || e.id == *relaunch.id() {
-                    if e.id == *relaunch.id() {
-                        tracing::info!("menu: restart app");
-                        if let Err(err) = relaunch_after_exit() {
-                            status.set_text(format!("Restart failed: {err:#}"));
-                            return;
-                        }
-                    }
-                    match &stop {
-                        Some(tx) => {
-                            // Let the session send STOP to the receiver before exiting.
-                            quitting = true;
-                            let _ = tx.send(true);
-                        }
-                        None => *flow = ControlFlow::Exit,
-                    }
-                } else if e.id == *rescan.id() {
-                    status.set_text("Looking for receivers…");
-                    rt.spawn(scan(proxy.clone()));
-                } else if let Some(i) = profiles.iter().position(|p| e.id == *p.id()) {
-                    profile = i;
-                    restart = casting;
-                } else if let Some(d) = devices.iter().find(|d| e.id == *d.item.id()) {
-                    selected = Some(d.name.clone());
-                    restart = casting;
-                } else if e.id == *audio.id() {
-                    restart = casting;
-                }
-                // Check items toggle themselves; keep exactly one profile and one receiver ticked.
-                for (i, p) in profiles.iter().enumerate() {
-                    p.set_checked(i == profile);
-                }
-                for d in &devices {
-                    d.item.set_checked(Some(&d.name) == selected.as_ref());
-                }
+                changed = true;
             }
             _ => {}
         }
         if restart && let Some(tx) = &stop {
             let _ = tx.send(true);
-            status.set_text("Restarting…");
+            state.status = "Restarting…".into();
         }
 
-        if begin && stop.is_none() {
-            let Some((addr, direct)) =
-                devices.iter().find(|d| Some(&d.name) == selected.as_ref()).map(|d| (d.addr.clone(), d.direct))
-            else {
-                return;
-            };
-            let Some(what) = target.clone() else { return };
+        if begin
+            && stop.is_none()
+            && let (Some(device), Some(what)) = (state.device(), state.target.clone())
+        {
+            let profile = &PROFILES[state.profile];
             let mut args = Cli::parse_from(["cast-mirror"]).mirror;
-            args.device = Some(addr);
-            args.delay = PROFILES[profile].delay;
-            args.fps = PROFILES[profile].fps;
-            args.width = PROFILES[profile].width;
-            args.bitrate = PROFILES[profile].bitrate;
-            args.auto = PROFILES[profile].auto;
-            args.no_audio = !audio.is_checked();
+            args.device = Some(device.addr.clone());
+            args.delay = profile.delay;
+            args.fps = profile.fps;
+            args.width = profile.width;
+            args.bitrate = profile.bitrate;
+            args.auto = profile.auto;
+            args.no_audio = !state.audio;
             match &what {
                 Target::Display(i, _) => args.display = *i,
                 Target::Window(id, _) => args.window = Some(id.to_string()),
             }
+            let direct = device.direct;
             if direct {
                 // HEVC: the TV's MediaTek HEVC decoder buffers less than its H.264 one.
                 args.codecs = vec![crate::Codec::Hevc];
@@ -353,26 +421,42 @@ pub fn run() -> Result<()> {
                         }
                     })
                 };
-                // A panic must still report Stopped, or the menu stays on "Stop casting" and Quit waits forever.
+                // A panic must still report Stopped, or the window stays on "Stop" and Quit waits forever.
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(session))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("session crashed, see the log")));
                 let _ = done.send_event(Ui::Stopped(result.err().map(|e| format!("Error: {e:#}"))));
             });
             stop = Some(tx);
-            status.set_text(format!("Starting {} ({})…", what.label(), PROFILES[profile].label));
+            state.status = format!("Starting {} ({})…", what.label(), profile.name);
             if let Some(t) = &tray {
                 let _ = t.set_icon_templated(Some(icon(true)));
             }
+            changed = true;
         }
         // Mute only while audio actually goes to the receiver; direct mode sends none.
-        let direct = devices.iter().any(|d| d.direct && Some(&d.name) == selected.as_ref());
-        let want_mute = stop.is_some() && mute.is_checked() && audio.is_checked() && !direct;
-        set_output_muted(want_mute, &mut muted_by_us);
-        let ready = selected.is_some();
-        screens.set_enabled(ready);
-        cast_window.set_enabled(ready);
-        stop_item.set_enabled(stop.is_some());
+        let direct = state.device().is_some_and(|d| d.direct);
+        set_output_muted(stop.is_some() && state.mute && state.audio && !direct, &mut muted_by_us);
+        if changed {
+            render(&webview, &state, stop.is_some());
+        }
     })
+}
+
+fn render(webview: &WebView, state: &State, casting: bool) {
+    if let Err(e) = webview.evaluate_script(&format!("render({})", state.view(casting))) {
+        tracing::warn!("ui: {e}");
+    }
+}
+
+/// `app://localhost/` is ui.html; `app://localhost/icon/<SF Symbol>` its icons, rendered from the system
+/// (no Apple artwork ships with the app) and tinted by CSS.
+fn serve(_: wry::WebViewId, request: wry::http::Request<Vec<u8>>) -> wry::http::Response<Cow<'static, [u8]>> {
+    let path = request.uri().path();
+    let (mime, body): (&str, Cow<'static, [u8]>) = match path.strip_prefix("/icon/") {
+        Some(name) => ("image/png", symbol_png(name).map(Cow::Owned).unwrap_or_default()),
+        None => ("text/html", Cow::Borrowed(include_str!("ui.html").as_bytes())),
+    };
+    wry::http::Response::builder().header("Content-Type", mime).body(body).expect("static response")
 }
 
 /// Mutes the Mac's output, or restores it if we muted it; leaves a mute the user set alone.
@@ -466,21 +550,18 @@ async fn scan(proxy: EventLoopProxy<Ui>) {
     let _ = proxy.send_event(Ui::Devices(devices));
 }
 
-fn icon_item(text: &str, enabled: bool, symbol_name: &str) -> IconMenuItem {
-    let item = IconMenuItem::new(text, enabled, None, None);
-    item.set_icon_templated(symbol(symbol_name));
-    item
-}
+// Icons for the window: 64 px is sharp at the largest size ui.html draws (26 pt) on Retina.
+const SYMBOL_PX: usize = 64;
 
-/// An SF Symbol as a template icon, which macOS tints for light and dark menus. Rendered from the
-/// system at runtime, so no Apple artwork ships with the app.
-fn symbol(name: &str) -> Option<tray_icon::menu::Icon> {
+fn symbol_png(name: &str) -> Option<Vec<u8>> {
     let rgba = symbol_rgba(name)?;
-    tray_icon::menu::Icon::from_rgba(rgba, SYMBOL_PX as u32, SYMBOL_PX as u32).ok()
+    let mut png = Vec::new();
+    let mut encoder = png::Encoder::new(&mut png, SYMBOL_PX as u32, SYMBOL_PX as u32);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header().ok()?.write_image_data(&rgba).ok()?;
+    Some(png)
 }
-
-// 18 pt (the tallest a menu icon gets) at 2x.
-const SYMBOL_PX: usize = 36;
 
 fn symbol_rgba(name: &str) -> Option<Vec<u8>> {
     use objc2_app_kit::{NSImage, NSImageSymbolConfiguration};
@@ -492,7 +573,7 @@ fn symbol_rgba(name: &str) -> Option<Vec<u8>> {
             tracing::warn!("no SF Symbol {name:?}");
             None
         })?;
-    let image = image.imageWithSymbolConfiguration(&NSImageSymbolConfiguration::configurationWithPointSize_weight(32.0, 0.0))?;
+    let image = image.imageWithSymbolConfiguration(&NSImageSymbolConfiguration::configurationWithPointSize_weight(56.0, 0.0))?;
     let cg = unsafe { image.CGImageForProposedRect_context_hints(std::ptr::null_mut(), None, None) }?;
     let (w, h) = (CGImage::width(Some(&cg)) as f64, CGImage::height(Some(&cg)) as f64);
     let mut rgba = vec![0u8; PX * PX * 4];
@@ -527,8 +608,9 @@ fn icon(casting: bool) -> Icon {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn menu_symbols_exist_and_render() {
-        for name in ["display", "laptopcomputer", "macwindow", "stop.circle", "tv", "arrow.clockwise", "arrow.triangle.2.circlepath", "power"] {
+    fn ui_symbols_exist_and_render() {
+        for name in ["display", "laptopcomputer", "macwindow", "tv", "bolt.fill", "checkmark", "arrow.clockwise", "arrow.triangle.2.circlepath", "power"] {
+            assert!(super::symbol_png(name).is_some());
             let rgba = super::symbol_rgba(name).unwrap_or_else(|| panic!("{name} did not render"));
             let drawn = rgba.chunks(4).filter(|p| p[3] > 0).count();
             println!("{name}: {drawn} pixels");

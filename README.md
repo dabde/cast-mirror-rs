@@ -27,11 +27,14 @@ Needs Screen Recording permission for the terminal (System Settings → Privacy 
 ## Menu bar app
 
 `scripts/bundle-app.sh` builds `~/Applications/CastMirror.app` (log: `~/Library/Logs/CastMirror.log`).
-The menu offers **Cast screen** (a submenu when several displays are connected), **Cast window…** (the macOS
-window picker), **Stop casting**, the receiver and a latency profile. While casting, picking another screen or
-window switches to it. **Rescan** sits in the Receiver submenu and refreshes the displays too. **Mute Mac while casting** silences the Mac's output: ScreenCaptureKit records the apps'
-audio before the output volume, so the receiver still gets all of it. After an update, macOS asks for the Screen
-Recording permission again; grant it, then use **Restart app**.
+A click on its menu bar icon opens a small window (a web view on the system's WebKit; `src/ui.html` is compiled
+into the binary): **Screen** (a list when several displays are connected) or **Window…** (the macOS window
+picker) to start, **Stop** while casting, the receivers (a TV with the app installed and network ADB authorized
+shows up a second time as "<name> · TV app" for direct mode), a latency profile, **Send audio** and **Mute Mac
+while casting** (ScreenCaptureKit records the apps' audio before the output volume, so the receiver still gets all
+of it). Picking another source while casting switches to it. A right click offers **Restart app** and **Quit**;
+after an update, macOS may ask for the Screen Recording permission again: grant it, then use Restart app.
+Icons are SF Symbols rendered from the system at runtime, so no Apple artwork ships with the app.
 
 ### Signing
 
@@ -161,6 +164,5 @@ The TV's graphics plane is 1920x1080 (`wm size` override on a 3840x2160 panel), 
 1080p at most. The tray restarts the app on the 4K video plane for profiles wider than 1920 (Presentation):
 sharp, but ~85 ms slower.
 
-Tray: a TV with the app installed and network ADB authorized shows up a second time under Receiver as
-"<name> · TV app"; picking it starts the app over ADB and streams HEVC. Not yet: audio. The Chromecast dongle
+In the menu bar app, picking "<name> · TV app" as receiver starts the app over ADB and streams HEVC. Not yet: audio. The Chromecast dongle
 runs classic Cast firmware and can't install apps.

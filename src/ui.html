@@ -1,0 +1,254 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --bg: #f6f6f6;
+    --fg: #1d1d1f;
+    --dim: #6e6e73;
+    --line: rgba(0, 0, 0, 0.1);
+    --hover: rgba(0, 0, 0, 0.06);
+    --accent: #0a84ff;
+    --danger: #ff3b30;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #28282a;
+      --fg: #f5f5f7;
+      --dim: #98989d;
+      --line: rgba(255, 255, 255, 0.12);
+      --hover: rgba(255, 255, 255, 0.08);
+    }
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { background: transparent; }
+  body {
+    font: 13px -apple-system, BlinkMacSystemFont, sans-serif;
+    color: var(--fg);
+    -webkit-user-select: none;
+    cursor: default;
+  }
+  #panel {
+    background: var(--bg);
+    border: 0.5px solid var(--line);
+    border-radius: 12px;
+    padding: 10px;
+    overflow: hidden;
+  }
+  .i {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    flex: none;
+    background: currentColor;
+    -webkit-mask: var(--i) center / contain no-repeat;
+  }
+  header { display: flex; align-items: center; gap: 8px; padding: 2px 4px 8px; }
+  header .text { flex: 1; min-width: 0; }
+  header .title { font-weight: 600; }
+  header .status { color: var(--dim); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); flex: none; }
+  .casting .dot { background: #30d158; }
+  button {
+    font: inherit;
+    color: inherit;
+    border: none;
+    background: none;
+    cursor: default;
+  }
+  #stop {
+    display: none;
+    color: #fff;
+    background: var(--danger);
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 600;
+  }
+  .casting #stop { display: block; }
+  .sources { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 4px; }
+  .source {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    padding: 10px 4px;
+    border-radius: 8px;
+    background: var(--hover);
+  }
+  .source .i { width: 26px; height: 26px; }
+  .source:hover:not(:disabled) { background: var(--line); }
+  .source.active { color: var(--accent); }
+  button:disabled { opacity: 0.4; }
+  h2 {
+    display: flex;
+    align-items: center;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--dim);
+    padding: 10px 6px 3px;
+  }
+  h2 span { flex: 1; }
+  h2 button { color: var(--dim); padding: 2px; border-radius: 4px; }
+  h2 button:hover { background: var(--hover); }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    text-align: left;
+    padding: 5px 6px;
+    border-radius: 6px;
+  }
+  .row:hover:not(:disabled) { background: var(--hover); }
+  .row .label { flex: 1; min-width: 0; }
+  .row .detail { display: block; font-size: 11px; color: var(--dim); }
+  .row .check { visibility: hidden; color: var(--accent); }
+  .row.on .check { visibility: visible; }
+  .empty { color: var(--dim); padding: 5px 6px; }
+  .toggle { display: flex; align-items: center; gap: 8px; padding: 5px 6px; }
+  .toggle .label { flex: 1; }
+  .switch {
+    width: 32px;
+    height: 18px;
+    border-radius: 9px;
+    background: var(--line);
+    position: relative;
+    transition: background 0.15s;
+  }
+  .switch::after {
+    content: "";
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+    transition: left 0.15s;
+  }
+  .switch.on { background: #30d158; }
+  .switch.on::after { left: 16px; }
+  footer {
+    display: flex;
+    gap: 4px;
+    border-top: 0.5px solid var(--line);
+    margin-top: 8px;
+    padding-top: 6px;
+  }
+  footer button { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 6px; color: var(--dim); }
+  footer button:hover { background: var(--hover); color: var(--fg); }
+  footer .spacer { flex: 1; }
+  #screens { display: none; }
+  #screens.open { display: block; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <header>
+    <div class="dot"></div>
+    <div class="text">
+      <div class="title">Cast Mirror</div>
+      <div class="status" id="status"></div>
+    </div>
+    <button id="stop" onclick="send({cmd: 'stop'})">Stop</button>
+  </header>
+
+  <div class="sources">
+    <button class="source" id="screen" onclick="castScreen()"><span class="i" style="--i: url(app://localhost/icon/display)"></span>Screen</button>
+    <button class="source" id="window" onclick="send({cmd: 'castWindow'})"><span class="i" style="--i: url(app://localhost/icon/macwindow)"></span>Window…</button>
+  </div>
+  <div id="screens"></div>
+
+  <h2><span>RECEIVER</span><button title="Rescan" onclick="send({cmd: 'rescan'})"><span class="i" style="--i: url(app://localhost/icon/arrow.clockwise)"></span></button></h2>
+  <div id="receivers"></div>
+
+  <h2><span>PROFILE</span></h2>
+  <div id="profiles"></div>
+
+  <h2><span>AUDIO</span></h2>
+  <div class="toggle" onclick="toggle('audio')"><span class="label">Send audio</span><div class="switch" id="audio"></div></div>
+  <div class="toggle" onclick="toggle('mute')"><span class="label">Mute Mac while casting</span><div class="switch" id="mute"></div></div>
+
+  <footer>
+    <button onclick="send({cmd: 'relaunch'})"><span class="i" style="--i: url(app://localhost/icon/arrow.triangle.2.circlepath)"></span>Restart app</button>
+    <span class="spacer"></span>
+    <button onclick="send({cmd: 'quit'})"><span class="i" style="--i: url(app://localhost/icon/power)"></span>Quit</button>
+  </footer>
+</div>
+<script>
+  let state = null;
+  const send = (msg) => window.ipc.postMessage(JSON.stringify(msg));
+  const el = (tag, cls, html) => {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (html !== undefined) e.innerHTML = html;
+    return e;
+  };
+  const esc = (s) => s.replace(/[&<>"]/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"})[c]);
+  const icon = (name) => `<span class="i" style="--i: url(app://localhost/icon/${name})"></span>`;
+  const check = icon("checkmark").replace('class="i"', 'class="i check"');
+
+  // One display: cast it. Several: show the list to pick from.
+  function castScreen() {
+    if (state.screens.length > 1) {
+      document.getElementById("screens").classList.toggle("open");
+      send({cmd: "height", px: document.getElementById("panel").offsetHeight});
+    } else {
+      send({cmd: "castScreen", index: 0});
+    }
+  }
+
+  function toggle(name) {
+    send({cmd: name, on: !state[name]});
+  }
+
+  function row(iconName, label, detail, on, onclick, enabled = true) {
+    const b = el("button", "row" + (on ? " on" : ""));
+    b.innerHTML = `${iconName ? icon(iconName) : ""}<span class="label">${esc(label)}${detail ? `<span class="detail">${esc(detail)}</span>` : ""}</span>${check}`;
+    b.disabled = !enabled;
+    b.onclick = onclick;
+    return b;
+  }
+
+  // Called by the app with the whole state after every change.
+  function render(s) {
+    state = s;
+    document.body.classList.toggle("casting", s.casting);
+    document.getElementById("status").textContent = s.status;
+    const ready = s.selected !== null;
+    for (const id of ["screen", "window"]) {
+      document.getElementById(id).disabled = !ready;
+    }
+    document.getElementById("screen").classList.toggle("active", s.casting && s.source === "screen");
+    document.getElementById("window").classList.toggle("active", s.casting && s.source === "window");
+
+    const screens = document.getElementById("screens");
+    screens.replaceChildren(...s.screens.map((name, i) =>
+      row(name.startsWith("Built-in") ? "laptopcomputer" : "display", name, null, false, () => {
+        screens.classList.remove("open");
+        send({cmd: "castScreen", index: i});
+      }, ready)));
+
+    const receivers = document.getElementById("receivers");
+    receivers.replaceChildren(...(s.receivers.length ? s.receivers.map((r) =>
+      row(r.direct ? "bolt.fill" : "tv", r.name, r.direct ? "Direct to the TV app, lowest latency" : "Cast",
+        r.name === s.selected, () => send({cmd: "receiver", name: r.name})))
+      : [el("div", "empty", "Looking for receivers…")]));
+
+    document.getElementById("profiles").replaceChildren(...s.profiles.map((p, i) =>
+      row(null, p.name, p.detail, i === s.profile, () => send({cmd: "profile", index: i}))));
+
+    document.getElementById("audio").classList.toggle("on", s.audio);
+    document.getElementById("mute").classList.toggle("on", s.mute);
+    send({cmd: "height", px: document.getElementById("panel").offsetHeight});
+  }
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") send({cmd: "hide"});
+  });
+  send({cmd: "ready"});
+</script>
+</body>
+</html>
