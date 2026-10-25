@@ -31,11 +31,27 @@
     white-space: pre-line;
   }
   #msg.hidden { display: none; }
+  #full {
+    position: fixed;
+    top: max(12px, env(safe-area-inset-top));
+    right: max(12px, env(safe-area-inset-right));
+    width: 44px;
+    height: 44px;
+    border: none;
+    border-radius: 22px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    font-size: 22px;
+    line-height: 44px;
+    transition: opacity 0.3s;
+  }
+  #full.idle { opacity: 0; pointer-events: none; }
 </style>
 </head>
 <body>
 <canvas id="screen"></canvas>
 <div id="msg">Connecting…</div>
+<button id="full" aria-label="Fullscreen">⛶</button>
 
 <!-- Decoding and drawing run in a worker, away from the main thread's other work. Frames reach it from
      the main thread, which owns the connections (WebRTC isn't available in workers). -->
@@ -97,9 +113,12 @@
     });
   }
 
-  // Wait for the next key frame and ask the Mac for one now; nothing buffered so far is of use.
+  // Wait for the next key frame and ask the Mac for one now; nothing buffered so far is of use. The decoder
+  // is configured again from that key frame: after a resize it has a new size, which Safari's decoder
+  // otherwise silently discarded.
   function restart() {
     expected = null;
+    configured = false;
     pending.clear();
     up("k");
   }
@@ -110,6 +129,7 @@
     const timestamp = Number(view.getBigUint64(5));
     const data = new Uint8Array(buffer, 13);
     if (!configured) {
+      if (!key) return;
       decoder.configure({codec: codecOf(data), optimizeForLatency: true, hardwareAcceleration: "prefer-hardware"});
       configured = true;
     }
@@ -176,6 +196,11 @@
       canvas = e.data.canvas;
       ctx = canvas.getContext("2d");
       newDecoder();
+    } else if (e.data.restart) {
+      // The Mac changed the picture size: start over from its next key frame.
+      expected = null;
+      configured = false;
+      pending.clear();
     } else if (e.data.reset) {
       // A new connection: frame numbers start over.
       pending.clear();
@@ -218,6 +243,8 @@
     if (typeof data === "string") {
       if (data[0] === "p") {
         sendUp("e" + data.slice(1));
+      } else if (data === "r") {
+        worker.postMessage({restart: true});
       } else if (data[0] === "{") {
         const message = JSON.parse(data);
         if (message.answer) pc?.setRemoteDescription({type: "answer", sdp: message.answer});
@@ -275,11 +302,44 @@
     if (document.visibilityState === "visible") keepAwake();
   });
 
-  // Tap for fullscreen (the browser only allows it after a gesture).
-  document.addEventListener("click", () => {
+  // Fullscreen button: shown on a tap, fades after 3 s, hidden while in fullscreen. The browser only allows
+  // fullscreen after a gesture.
+  const full = document.getElementById("full");
+  const inFullscreen = () => !!(document.fullscreenElement || document.webkitFullscreenElement);
+  let idle = 0;
+  function showButton() {
+    full.classList.toggle("idle", inFullscreen());
+    clearTimeout(idle);
+    idle = setTimeout(() => full.classList.add("idle"), 3000);
+  }
+  full.addEventListener("click", (e) => {
+    e.stopPropagation();
+    keepAwake();
+    // Safari on the iPhone allows fullscreen only for <video>; from the home screen the page has no bars.
+    if (!document.fullscreenEnabled && !document.webkitFullscreenEnabled) {
+      show("Fullscreen isn't available in this browser.\nShare → Add to Home Screen, then open it from there:\nit runs without the browser bars.");
+      setTimeout(() => show(""), 5000);
+      return;
+    }
     const el = document.documentElement;
     (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el);
+  });
+  document.addEventListener("click", () => {
+    showButton();
     keepAwake();
+  });
+  showButton();
+
+  // The view grows in fullscreen (no toolbars) or changes with rotation: let the Mac capture for the new
+  // size, so the picture stays pixel for pixel.
+  let resizing = 0;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizing);
+    resizing = setTimeout(() => {
+      const ratio = window.devicePixelRatio || 1;
+      sendUp(JSON.stringify({width: Math.round(window.innerWidth * ratio), height: Math.round(window.innerHeight * ratio)}));
+      showButton();
+    }, 300);
   });
 
   const canvas = document.getElementById("screen");

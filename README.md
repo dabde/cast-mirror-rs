@@ -55,7 +55,10 @@ Grant the permission once more after the first signed build; later builds keep i
 ## Browser receiver
 
 `cast-mirror web --fps 60 --bitrate 20M` serves a receiver page any browser with WebCodecs can open (an iPad, a
-laptop): it prints a link `https://<this Mac>:7443/#<token>`. In the menu bar app, pick **Browser (iPad, laptop…)** as receiver: the window shows the link and a QR code to scan
+laptop): it prints a link `https://<this Mac>:7443/#<token>`. The page has a fullscreen button (iPad, desktop browsers; Safari on the iPhone allows fullscreen only for video,
+so there it suggests Add to Home Screen). Entering fullscreen or rotating changes the view; the page reports the new
+size and the Mac captures for it, the decoder starting over from the next key frame.
+In the menu bar app, pick **Browser (iPad, laptop…)** as receiver: the window shows the link and a QR code to scan
 with the iPad camera, and Screen or Window… starts serving (60 fps, 20 Mbit/s). The page reports its screen in pixels and the Mac
 captures to fit exactly that (2314x1494 for an iPad Pro 11" in Safari), so the picture isn't scaled twice. The certificate is self-signed (the browser asks
 once); the token in the link is the access check.

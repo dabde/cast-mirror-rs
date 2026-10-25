@@ -49,6 +49,8 @@ enum Request {
     KeyFrame,
     Echo(u64),
     Offer(String),
+    // The page's visible area changed (fullscreen, rotation): capture to fit the new one.
+    Resize(u32, u32),
     ChannelOpen,
     // The data channel couldn't take a frame.
     Skipped,
@@ -195,7 +197,11 @@ fn parse_text(payload: &[u8], peer: SocketAddr) -> Option<Request> {
         }
         b'{' => {
             let message: serde_json::Value = serde_json::from_slice(payload).ok()?;
-            Some(Request::Offer(message["offer"].as_str()?.to_string()))
+            if let Some(offer) = message["offer"].as_str() {
+                return Some(Request::Offer(offer.to_string()));
+            }
+            let pixels = |key: &str| message[key].as_u64().map(|v| v as u32).filter(|v| (320..=7680).contains(v));
+            Some(Request::Resize(pixels("width")?, pixels("height")?))
         }
         _ => None,
     }
@@ -310,8 +316,8 @@ async fn stream(
 
     let fps = args.fps;
     let latest = Arc::new(LatestFrame::default());
-    let bounds = screen.unwrap_or(capture::box_16_9(args.width));
-    let cap = Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
+    let mut bounds = screen.unwrap_or(capture::box_16_9(args.width));
+    let mut cap = Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
     info!("browser {peer}: screen {bounds:?}, sending {}x{}", cap.width, cap.height);
     let mut bitrate = args.bitrate;
     let mut encoder = VideoEncoder::new(Codec::H264High, cap.width, cap.height, fps, bitrate)?;
@@ -335,6 +341,31 @@ async fn stream(
                 match r {
                     Some(Request::KeyFrame) => need_key = true,
                     Some(Request::Echo(sent_at)) => rtts.push(now_us().saturating_sub(sent_at)),
+                    Some(Request::Resize(width, height)) if (width, height) != bounds => {
+                        bounds = (width, height);
+                        drop(cap);
+                        (cap, encoder) = tokio::task::block_in_place(|| -> Result<_> {
+                            let cap = Capture::start(args.display, args.window.as_deref(), bounds, fps, latest.clone(), None)?;
+                            let mut encoder = VideoEncoder::new(Codec::H264High, cap.width, cap.height, fps, bitrate)?;
+                            encoder.set_max_qp(args.max_qp);
+                            Ok((cap, encoder))
+                        })?;
+                        info!("browser {peer}: view {bounds:?}, sending {}x{}", cap.width, cap.height);
+                        // The page starts over from the next key frame, decoder included (new size).
+                        let reset = b"r".to_vec();
+                        match &channel {
+                            Some(c) => {
+                                let _ = c.try_send([&[0xff], &reset[..]].concat());
+                            }
+                            None => {
+                                let _ = ws_tx.try_send(frame_bytes(1, &reset));
+                            }
+                        }
+                        last = None;
+                        need_key = true;
+                        last_key = None;
+                    }
+                    Some(Request::Resize(..)) => {}
                     Some(Request::Offer(sdp)) => match webrtc(&sdp, lan, peer, requests_tx.clone()).await {
                         Ok((answer, frames)) => {
                             pending_channel = Some(frames);
