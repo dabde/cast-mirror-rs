@@ -5,6 +5,7 @@ mod mirror;
 mod pairing;
 mod tray;
 mod video;
+mod web;
 #[cfg(feature = "vp8")]
 mod vp8;
 
@@ -36,6 +37,11 @@ enum Command {
     Launch { device: String },
     /// Menu-bar app with receiver and profile selection.
     Tray,
+    /// Serve a receiver page any browser (iPad, laptop) can open; prints the link.
+    Web {
+        #[command(flatten)]
+        args: MirrorArgs,
+    },
     /// Pair with the cast-mirror app on a device (its IP), so --direct works without ADB.
     Pair { device: String },
     /// Stop a running mirroring app (e.g. after the sender was killed).
@@ -201,6 +207,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             std::mem::forget(connection);
             Ok(())
         }
+        Some(Command::Web { args }) => web::run(args, mirror::Control::ctrl_c()).await,
         Some(Command::Pair { device }) => {
             let addr = device.parse().or_else(|_| format!("{device}:{}", direct::PORT).parse())?;
             let mut store = pairing::Store::load();

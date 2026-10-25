@@ -1,0 +1,198 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Cast Mirror</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #msg {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 24px;
+    color: #f5f5f7;
+    font: 18px -apple-system, BlinkMacSystemFont, sans-serif;
+    white-space: pre-line;
+  }
+  #msg.hidden { display: none; }
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<div id="msg">Connecting…</div>
+
+<!-- Receiving, decoding and drawing run in a worker: on the main thread, layout and other page work
+     delayed the decoder's output by up to 140 ms and frames backed up. -->
+<script id="worker" type="text/plain">
+  // Frames from `cast-mirror web`: flags u8 (bit0 key) | timestamp µs u64 | H.264 Annex B.
+  let canvas, ctx, ws, decoder, url, token;
+  let configured = false;
+  // After skipping, delta frames are useless until the next key frame.
+  let waitingForKey = false;
+  const stats = {decoded: 0, skipped: 0, maxQueue: 0, decodeMs: 0, errors: 0};
+  const queued = new Map();
+  let shown = false;
+
+  const status = (text) => postMessage({status: text});
+
+  // "avc1.PPCCLL" from the SPS (NAL type 7) the key frame starts with.
+  function codecOf(data) {
+    for (let i = 0; i + 4 < data.length; i++) {
+      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1 && (data[i + 3] & 0x1f) === 7) {
+        const hex = (b) => b.toString(16).padStart(2, "0");
+        return "avc1." + hex(data[i + 4]) + hex(data[i + 5]) + hex(data[i + 6]);
+      }
+    }
+    return "avc1.4d0028";
+  }
+
+  function newDecoder() {
+    configured = false;
+    decoder = new VideoDecoder({
+      output(frame) {
+        if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+          canvas.width = frame.displayWidth;
+          canvas.height = frame.displayHeight;
+        }
+        ctx.drawImage(frame, 0, 0);
+        const start = queued.get(frame.timestamp);
+        if (start !== undefined) {
+          stats.decodeMs = Math.max(stats.decodeMs, performance.now() - start);
+          queued.delete(frame.timestamp);
+        }
+        stats.decoded++;
+        if (!shown) {
+          shown = true;
+          status("");
+        }
+        frame.close();
+      },
+      error(e) {
+        stats.errors++;
+        console.warn(e);
+        // A closed decoder can't be reused: start over and ask for a key frame.
+        newDecoder();
+        if (ws && ws.readyState === WebSocket.OPEN) ws.send("k");
+      },
+    });
+  }
+
+  function onFrame(buffer) {
+    const view = new DataView(buffer);
+    const key = (view.getUint8(0) & 1) === 1;
+    const timestamp = Number(view.getBigUint64(1));
+    const data = new Uint8Array(buffer, 9);
+    if (!configured) {
+      if (!key) return;
+      decoder.configure({codec: codecOf(data), optimizeForLatency: true, hardwareAcceleration: "prefer-hardware"});
+      configured = true;
+    }
+    if (waitingForKey && !key) return;
+    waitingForKey = false;
+    stats.maxQueue = Math.max(stats.maxQueue, decoder.decodeQueueSize);
+    // Safari's decoder releases a frame only when the next one comes in, so a backlog never drains: every
+    // hiccup would stay as extra delay. Flush pushes out what it holds; then start over from a key frame.
+    if (decoder.decodeQueueSize > 3 && !key) {
+      stats.skipped++;
+      waitingForKey = true;
+      decoder.flush().catch(() => {});
+      ws.send("k");
+      return;
+    }
+    queued.set(timestamp, performance.now());
+    if (queued.size > 120) queued.clear();
+    decoder.decode(new EncodedVideoChunk({type: key ? "key" : "delta", timestamp, data}));
+  }
+
+  function connect() {
+    ws = new WebSocket(url);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      ws.send(JSON.stringify({token}));
+      status("Waiting for the picture…");
+    };
+    ws.onmessage = (e) => {
+      if (typeof e.data !== "string") {
+        onFrame(e.data);
+      } else if (e.data[0] === "p") {
+        ws.send("e" + e.data.slice(1));
+      }
+    };
+    ws.onclose = () => {
+      status("Disconnected. Retrying…");
+      shown = false;
+      newDecoder();
+      setTimeout(connect, 1000);
+    };
+  }
+
+  setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send("s" + `decoded ${stats.decoded} fps · skipped ${stats.skipped} · max queue ${stats.maxQueue} · ` +
+        `slowest decode ${stats.decodeMs.toFixed(1)} ms · decoder errors ${stats.errors}`);
+    }
+    Object.assign(stats, {decoded: 0, skipped: 0, maxQueue: 0, decodeMs: 0, errors: 0});
+  }, 1000);
+
+  onmessage = (e) => {
+    ({canvas, url, token} = e.data);
+    ctx = canvas.getContext("2d");
+    if (!("VideoDecoder" in self)) {
+      status("This browser has no WebCodecs in workers.\nUse a current Safari, Chrome or Edge.");
+      return;
+    }
+    newDecoder();
+    connect();
+  };
+</script>
+
+<script>
+  const msg = document.getElementById("msg");
+  const token = location.hash.slice(1);
+
+  function show(text) {
+    msg.textContent = text;
+    msg.classList.toggle("hidden", !text);
+  }
+
+  // Keep the screen on while watching; the lock is released whenever the page is hidden.
+  async function keepAwake() {
+    try {
+      await navigator.wakeLock?.request("screen");
+    } catch (e) {
+      console.warn(e);
+    }
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") keepAwake();
+  });
+
+  // Tap for fullscreen (the browser only allows it after a gesture).
+  document.addEventListener("click", () => {
+    const el = document.documentElement;
+    (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el);
+    keepAwake();
+  });
+
+  const canvas = document.getElementById("screen");
+  if (!canvas.transferControlToOffscreen) {
+    show("This browser can't draw from a worker (OffscreenCanvas).\nUse a current Safari, Chrome or Edge.");
+  } else if (!token) {
+    show("This link is missing its access code.\nOpen the full link the Mac shows.");
+  } else {
+    const source = document.getElementById("worker").textContent;
+    const worker = new Worker(URL.createObjectURL(new Blob([source], {type: "text/javascript"})));
+    worker.onmessage = (e) => show(e.data.status);
+    const offscreen = canvas.transferControlToOffscreen();
+    worker.postMessage({canvas: offscreen, url: `wss://${location.host}/ws`, token}, [offscreen]);
+    keepAwake();
+  }
+</script>
+</body>
+</html>

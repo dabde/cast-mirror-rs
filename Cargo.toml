@@ -18,9 +18,13 @@ objc2-core-video = "0.3.2"
 objc2-video-toolbox = "0.3.2"
 opus = "0.4.0"
 ring = "0.17.14"
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+base64 = "0.23"
 screencapturekit = { version = "8", features = ["macos_14_0"] }
 tao = "0.37.2"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "process"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "signal", "time", "sync", "process", "net", "io-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tray-icon = "0.26.1"

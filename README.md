@@ -52,6 +52,16 @@ rm /tmp/cs.cnf /tmp/cs.key /tmp/cs.pem /tmp/cs.p12
 
 Grant the permission once more after the first signed build; later builds keep it.
 
+## Browser receiver
+
+`cast-mirror web` serves a receiver page any browser with WebCodecs can open (an iPad, a laptop): it prints a link
+`https://<this Mac>:7443/#<token>`. The certificate is self-signed (the browser asks once); the token in the link
+is the access check. The page decodes H.264 in a worker (WebCodecs, hardware) and draws to a canvas.
+
+Over a WebSocket (TCP) it stutters on Wi-Fi: on an iPad Pro 11" the round trip jumps to 100-216 ms even at
+0.2 Mbit/s (UDP to the TV app: 6-16 ms), and Safari's decoder releases a frame only when the next one comes in,
+so every TCP burst adds delay that has to be flushed. 30 fps works better than 60; a UDP path is next.
+
 ## Layout
 
 - `src/capture.rs`: ScreenCaptureKit, NV12 frames (latest-only, never queued) and 48 kHz stereo audio

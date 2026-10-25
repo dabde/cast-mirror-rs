@@ -293,6 +293,7 @@ name = "cast-mirror"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "chromiacast",
  "clap",
@@ -307,12 +308,15 @@ dependencies = [
  "objc2-video-toolbox",
  "opus",
  "png",
+ "rcgen",
  "ring",
+ "rustls",
  "screencapturekit",
  "serde",
  "serde_json",
  "tao",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "tray-icon",
