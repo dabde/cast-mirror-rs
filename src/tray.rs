@@ -510,11 +510,18 @@ fn icon_item(text: &str, enabled: bool, symbol_name: &str) -> IconMenuItem {
 /// An SF Symbol as a template icon, which macOS tints for light and dark menus. Rendered from the
 /// system at runtime, so no Apple artwork ships with the app.
 fn symbol(name: &str) -> Option<tray_icon::menu::Icon> {
+    let rgba = symbol_rgba(name)?;
+    tray_icon::menu::Icon::from_rgba(rgba, SYMBOL_PX as u32, SYMBOL_PX as u32).ok()
+}
+
+// 18 pt (the tallest a menu icon gets) at 2x.
+const SYMBOL_PX: usize = 36;
+
+fn symbol_rgba(name: &str) -> Option<Vec<u8>> {
     use objc2_app_kit::{NSImage, NSImageSymbolConfiguration};
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
     use objc2_core_graphics::{CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo};
-    // 18 pt (the tallest a menu icon gets) at 2x.
-    const PX: usize = 36;
+    const PX: usize = SYMBOL_PX;
     let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(&objc2_foundation::NSString::from_str(name), None)
         .or_else(|| {
             tracing::warn!("no SF Symbol {name:?}");
@@ -532,7 +539,7 @@ fn symbol(name: &str) -> Option<tray_icon::menu::Icon> {
     let origin = CGPoint::new((PX as f64 - size.width) / 2.0, (PX as f64 - size.height) / 2.0);
     CGContext::draw_image(Some(&ctx), CGRect::new(origin, size), Some(&cg));
     drop(ctx);
-    tray_icon::menu::Icon::from_rgba(rgba, PX as u32, PX as u32).ok()
+    Some(rgba)
 }
 
 /// 22x22 template icon: a screen outline, filled while casting.
@@ -557,8 +564,10 @@ mod tests {
     #[test]
     fn menu_symbols_exist_and_render() {
         for name in ["display", "laptopcomputer", "macwindow", "stop.circle", "tv", "arrow.clockwise", "arrow.triangle.2.circlepath", "power"] {
-            let icon = super::symbol(name).unwrap_or_else(|| panic!("{name} did not render"));
-            drop(icon);
+            let rgba = super::symbol_rgba(name).unwrap_or_else(|| panic!("{name} did not render"));
+            let drawn = rgba.chunks(4).filter(|p| p[3] > 0).count();
+            println!("{name}: {drawn} pixels");
+            assert!(drawn > 50, "{name} rendered empty");
         }
     }
 }
