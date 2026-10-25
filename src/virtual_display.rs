@@ -84,6 +84,11 @@ impl VirtualDisplay {
 
 }
 
+/// `size` times `scale`, in even pixels.
+pub fn scaled((width, height): (u32, u32), scale: f64) -> (u32, u32) {
+    ((width as f64 * scale) as u32 & !1, (height as f64 * scale) as u32 & !1)
+}
+
 /// Half the pixels, but grown to the smallest height macOS still renders at 2x (the capture scales it
 /// down to the view again: a few percent, much sharper than 1x scaled up).
 fn retina_points(width: u32, height: u32) -> (u32, u32) {
@@ -111,6 +116,7 @@ mod tests {
     fn retina_points_grow_to_the_lowest_retina_height() {
         assert_eq!(retina_points(2388, 1668), (1194, 834));
         assert_eq!(retina_points(2622, 1014), (1396, 540));
+        assert_eq!(scaled((2388, 1668), 1.25), (2984, 2084));
     }
 
     #[test]

@@ -44,6 +44,12 @@ const PROFILES: [Profile; 6] = [
     Profile { name: "Auto", detail: "TV app: adapts to the Wi-Fi", delay: 100, fps: 60, width: 1920, bitrate: 6_000_000, auto: true },
 ];
 const DEFAULT_PROFILE: usize = 1;
+// Extend: the second screen's size relative to the receiver.
+const SCALES: [(&str, &str, f64); 3] = [
+    ("Larger text", "Fewer points, scaled up a little", 0.8),
+    ("Default", "The receiver's own size, sharpest", 1.0),
+    ("More space", "More points, scaled down a little", 1.25),
+];
 const BROWSER: &str = "Browser (iPad, laptop…)";
 // Measured on an iPad Pro over Wi-Fi at its native resolution: 10 looked blocky in motion, 30 still fit.
 const BROWSER_BITRATE: u32 = 20_000_000;
@@ -79,6 +85,7 @@ enum Cmd {
     Stop,
     Receiver { name: String },
     Profile { index: usize },
+    Scale { index: usize },
     Audio { on: bool },
     Mute { on: bool },
     Encrypt { on: bool },
@@ -149,6 +156,7 @@ struct State {
     selected: Option<String>,
     screens: Vec<String>,
     profile: usize,
+    scale: usize,
     target: Option<Target>,
     audio: bool,
     mute: bool,
@@ -185,6 +193,8 @@ impl State {
             "screens": self.screens,
             "profiles": PROFILES.iter().map(|p| serde_json::json!({"name": p.name, "detail": p.detail})).collect::<Vec<_>>(),
             "profile": self.profile,
+            "scales": SCALES.iter().map(|(name, detail, _)| serde_json::json!({"name": name, "detail": detail})).collect::<Vec<_>>(),
+            "scale": self.scale,
             "audio": self.audio,
             "mute": self.mute,
             "encrypt": self.encrypt,
@@ -259,6 +269,7 @@ pub fn run() -> Result<()> {
         selected: None,
         screens: Vec::new(),
         profile: DEFAULT_PROFILE,
+        scale: 1,
         target: None,
         audio: true,
         mute: false,
@@ -395,6 +406,10 @@ pub fn run() -> Result<()> {
                     Cmd::Profile { index } => {
                         state.profile = index.min(PROFILES.len() - 1);
                         restart = casting;
+                    }
+                    Cmd::Scale { index } => {
+                        state.scale = index.min(SCALES.len() - 1);
+                        restart = casting && matches!(state.target, Some(Target::Extend));
                     }
                     Cmd::Audio { on } => {
                         state.audio = on;
@@ -567,7 +582,10 @@ pub fn run() -> Result<()> {
             match &what {
                 Target::Display(i, _) => args.display = *i,
                 Target::Window(id, _) => args.window = Some(id.to_string()),
-                Target::Extend => args.extend = true,
+                Target::Extend => {
+                    args.extend = true;
+                    args.scale = SCALES[state.scale].2;
+                }
             }
             let (direct, web) = (device.direct, device.web);
             if web {

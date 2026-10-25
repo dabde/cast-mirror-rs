@@ -81,7 +81,8 @@ pub async fn run(args: MirrorArgs, source: Source, control: Control) -> Result<(
     // A second monitor instead of a mirror: 1920x1080 at 1x, crisp at TV size. It lives as long as this run.
     let mut args = args;
     let _extended = if args.extend {
-        let display = crate::virtual_display::VirtualDisplay::create("Cast Mirror", 1920, 1080, false)?;
+        let (width, height) = crate::virtual_display::scaled((1920, 1080), args.scale);
+        let display = crate::virtual_display::VirtualDisplay::create("Cast Mirror", width, height, false)?;
         args.display = capture::display_index(display.id)?;
         Some(display)
     } else {

@@ -9,13 +9,17 @@
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   /* Shown pixel for pixel (the main script sets its size from the picture): any stretch blurs text. It only
      shrinks, to fit, if the view got smaller than the picture. */
-  canvas {
+  /* The area clear of the notch or island and the rounded corners; the Mac sends exactly its size. */
+  #area {
     position: fixed;
-    left: 50%;
-    top: 50%;
-    transform: translate(-50%, -50%);
-    max-width: 100vw;
-    max-height: 100vh;
+    inset: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    max-width: 100%;
+    max-height: 100%;
     object-fit: contain;
   }
   #msg {
@@ -49,7 +53,7 @@
 </style>
 </head>
 <body>
-<canvas id="screen"></canvas>
+<div id="area"><canvas id="screen"></canvas></div>
 <div id="msg">Connecting…</div>
 <button id="full" aria-label="Fullscreen">⛶</button>
 
@@ -309,13 +313,7 @@
     ws.onopen = () => {
       // The screen in pixels, landscape: the Mac sends exactly that, so the picture isn't scaled again.
       // The visible area in device pixels: the Mac fits the picture into it.
-      const ratio = window.devicePixelRatio || 1;
-      ws.send(JSON.stringify({
-        token,
-        version: VERSION,
-        width: Math.round(window.innerWidth * ratio),
-        height: Math.round(window.innerHeight * ratio),
-      }));
+      ws.send(JSON.stringify({token, version: VERSION, ...viewSize()}));
       show("Waiting for the picture…");
       startWebRtc().catch((e) => console.warn("WebRTC", e));
     };
@@ -372,11 +370,15 @@
   // The view grows in fullscreen (no toolbars) or changes with rotation: let the Mac capture for the new
   // size, so the picture stays pixel for pixel.
   let resizing = 0;
+  function viewSize() {
+    const ratio = window.devicePixelRatio || 1;
+    const area = document.getElementById("area");
+    return {width: Math.round(area.clientWidth * ratio), height: Math.round(area.clientHeight * ratio)};
+  }
   window.addEventListener("resize", () => {
     clearTimeout(resizing);
     resizing = setTimeout(() => {
-      const ratio = window.devicePixelRatio || 1;
-      sendUp(JSON.stringify({width: Math.round(window.innerWidth * ratio), height: Math.round(window.innerHeight * ratio)}));
+      sendUp(JSON.stringify(viewSize()));
       showButton();
     }, 300);
   });

@@ -76,6 +76,10 @@ pub struct MirrorArgs {
     /// mirroring one.
     #[arg(long)]
     pub extend: bool,
+    /// With --extend: the display's size relative to the receiver; above 1 fits more (smaller text), below 1
+    /// shows larger text. The picture is scaled to the receiver either way.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_scale)]
+    pub scale: f64,
     /// Display index as listed by ScreenCaptureKit.
     #[arg(long, default_value_t = 0)]
     pub display: usize,
@@ -166,6 +170,11 @@ pub async fn connect_and_launch(addr: SocketAddr, unverified: bool) -> Result<(C
     }
     let app = connection.launch(APP_MIRRORING).await.context("launching mirroring app")?;
     Ok((connection, app))
+}
+
+fn parse_scale(s: &str) -> Result<f64, String> {
+    let scale: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if (0.5..=2.0).contains(&scale) { Ok(scale) } else { Err("between 0.5 and 2".into()) }
 }
 
 fn main() -> Result<()> {

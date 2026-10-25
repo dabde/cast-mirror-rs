@@ -219,6 +219,9 @@
   <h2><span>PROFILE</span></h2>
   <div id="profiles"></div>
 
+  <h2><span>EXTEND SIZE</span></h2>
+  <div id="scales"></div>
+
   <h2><span>AUDIO</span></h2>
   <div class="toggle" onclick="toggle('audio')"><span class="label">Send audio</span><div class="switch" id="audio"></div></div>
   <div class="toggle" onclick="toggle('mute')"><span class="label">Mute Mac while casting</span><div class="switch" id="mute"></div></div>
@@ -297,6 +300,8 @@
         r.name === s.selected, () => send({cmd: "receiver", name: r.name})))
       : [el("div", "empty", "Looking for receivers…")]));
 
+    document.getElementById("scales").replaceChildren(...s.scales.map((p, i) =>
+      row(null, p.name, p.detail, i === s.scale, () => send({cmd: "scale", index: i}))));
     document.getElementById("profiles").replaceChildren(...s.profiles.map((p, i) =>
       row(null, p.name, p.detail, i === s.profile, () => send({cmd: "profile", index: i}))));
 

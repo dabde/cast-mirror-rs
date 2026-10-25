@@ -344,7 +344,10 @@ async fn stream(
     // A second monitor at the view's exact size; Retina (half the points) for a close-up screen.
     let hidpi = |(width, _): (u32, u32)| width >= 1600;
     let extended = match args.extend {
-        true => Some(crate::virtual_display::VirtualDisplay::create("Cast Mirror", bounds.0, bounds.1, hidpi(bounds))?),
+        true => {
+            let (w, h) = crate::virtual_display::scaled(bounds, args.scale);
+            Some(crate::virtual_display::VirtualDisplay::create("Cast Mirror", w, h, hidpi(bounds))?)
+        }
         false => None,
     };
     let display = match &extended {
@@ -379,7 +382,8 @@ async fn stream(
                         bounds = (width, height);
                         if let Some(d) = &extended {
                             // Same display in a new mode, so the windows on it stay.
-                            d.set_mode(width, height, hidpi(bounds))?;
+                            let (w, h) = crate::virtual_display::scaled(bounds, args.scale);
+                            d.set_mode(w, h, hidpi(bounds))?;
                             tokio::time::sleep(Duration::from_millis(300)).await;
                         }
                         drop(cap);

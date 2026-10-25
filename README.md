@@ -65,6 +65,9 @@ browser it is Retina-sized to the view and follows fullscreen/rotation; for the 
 It uses CoreGraphics' private `CGVirtualDisplay` (as BetterDisplay and DeskPad do), which a macOS update could
 break. macOS renders Retina only from about 530 points of height, so a lower view (an iPhone in landscape)
 gets a slightly larger display that the capture scales down a few percent.
+**Extend size** in the window (`--scale`) sets the display relative to the receiver: Larger text (0.8), Default
+(1.0, sharpest) or More space (1.25); the picture is scaled to the receiver either way. The page keeps the
+picture clear of a notch or the iPhone's island (the safe area) and reports that area as its view.
 In the menu bar app, pick **Browser (iPad, laptop…)** as receiver: the window shows the link and a QR code to scan
 with the iPad camera, and Screen or Window… starts serving (60 fps, 20 Mbit/s). The page reports its screen in pixels and the Mac
 captures to fit exactly that (2314x1494 for an iPad Pro 11" in Safari), so the picture isn't scaled twice. The certificate is self-signed (the browser asks
