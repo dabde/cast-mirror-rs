@@ -83,6 +83,8 @@ struct Found {
     name: String,
     addr: String,
     tv_app: bool,
+    // False for a device found only over ADB (a phone after `adb tcpip 5555`): direct mode only.
+    cast: bool,
 }
 
 /// A receiver entry: a Cast receiver, or its TV app (direct mode).
@@ -340,10 +342,13 @@ pub fn run() -> Result<()> {
                         let name = format!("{} · TV app", f.name);
                         state.devices.push(Device { name, addr: f.addr.clone(), direct: true });
                     }
-                    state.devices.push(Device { name: f.name, addr: f.addr, direct: false });
+                    if f.cast {
+                        state.devices.push(Device { name: f.name, addr: f.addr, direct: false });
+                    }
                 }
                 if state.device().is_none() {
-                    state.selected = state.devices.iter().find(|d| !d.direct).map(|d| d.name.clone());
+                    let first = state.devices.iter().find(|d| !d.direct).or(state.devices.first());
+                    state.selected = first.map(|d| d.name.clone());
                 }
                 // Displays come and go like receivers; refresh both on every scan.
                 state.screens = crate::capture::display_labels().inspect_err(|e| tracing::warn!("{e:#}")).unwrap_or_default();
@@ -569,9 +574,45 @@ async fn scan(proxy: EventLoopProxy<Ui>) {
     let mut devices = Vec::new();
     for (d, check) in found.iter().zip(checks) {
         let tv_app = check.await.unwrap_or(false);
-        devices.push(Found { name: d.name().to_string(), addr: d.preferred_endpoint().address().to_string(), tv_app });
+        devices.push(Found {
+            name: d.name().to_string(),
+            addr: d.preferred_endpoint().address().to_string(),
+            tv_app,
+            cast: true,
+        });
+    }
+    // Devices ADB already reaches over the network that run the app but aren't Cast receivers.
+    for host in adb_hosts().await {
+        let known = devices.iter().any(|d| d.addr.starts_with(&format!("{host}:")));
+        if !known && tv_app_installed(host.clone()).await {
+            let name = adb_name(&host).await;
+            devices.push(Found { name, addr: format!("{host}:{}", crate::direct::PORT), tv_app: true, cast: false });
+        }
     }
     let _ = proxy.send_event(Ui::Devices(devices));
+}
+
+/// Hosts `adb devices` lists as connected over the network on port 5555.
+async fn adb_hosts() -> Vec<String> {
+    let Ok(out) = crate::direct::adb(&["devices"], Duration::from_secs(3)).await else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.strip_suffix("\tdevice")?.strip_suffix(":5555").map(str::to_string))
+        .collect()
+}
+
+/// A device's marketing name ("HUAWEI P10"), else its model, else the address.
+async fn adb_name(host: &str) -> String {
+    let serial = format!("{host}:5555");
+    for prop in ["ro.config.marketing_name", "ro.product.model"] {
+        if let Ok(out) = crate::direct::adb(&["-s", &serial, "shell", "getprop", prop], Duration::from_secs(3)).await {
+            let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !name.is_empty() {
+                return name;
+            }
+        }
+    }
+    host.to_string()
 }
 
 // Icons for the window: 64 px is sharp at the largest size ui.html draws (26 pt) on Retina.
