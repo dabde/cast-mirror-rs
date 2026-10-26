@@ -1,4 +1,4 @@
-# Technical notes
+#!/bin/zsh
 # Builds and signs the Android TV receiver without Gradle. Optional: ./build.sh install HOST
 set -eu
 cd ${0:A:h}

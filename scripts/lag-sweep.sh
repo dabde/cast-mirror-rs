@@ -1,4 +1,4 @@
-# Technical notes
+#!/bin/zsh
 # Mirror with several settings; screenshot the lag wheel next to a webcam view of the TV (e.g. Photo Booth).
 # Usage: scripts/lag-sweep.sh DEVICE [OUTDIR [CONFIG...]]   (~25 s each; CONFIG = "name --flags...")
 set -u

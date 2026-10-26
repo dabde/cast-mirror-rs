@@ -1,4 +1,4 @@
-# Technical notes
+#!/bin/zsh
 # Record a Chrome "Cast screen" session to a receiver and summarise it.
 # Once: brew install --cask wireshark-chmodbpf  (admin password; gives non-root capture access)
 # Usage: scripts/capture-chrome.sh RECEIVER_IP [SECONDS]  (your normal Chrome can stay open)
