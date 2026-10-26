@@ -7,7 +7,7 @@ All on Wi-Fi, MacBook Pro sending.
 |---|---|---|
 | TV app, HEVC 60 fps (Philips TPM191E) | **~70-90 ms** | own Android app, encrypted |
 | Chromecast dongle, TV in Game mode, `--delay 60` | ~95-110 ms | Cast Streaming |
-| Browser, iPad Pro 11" (2018) | 50-80 ms | WebRTC data channel, 57 fps at 60 |
+| Browser, iPad Pro 11" (2018) | **~35-45 ms** (window), 50-80 ms (screen) | WebRTC data channel |
 | TV's built-in Cast app, `--delay 150` | ~200-240 ms | keeps its own ~150 ms buffer |
 | Chrome "Cast screen" to the built-in app | ~300 ms | the baseline to beat |
 | VLC `screen://` → Chromecast | 17-23 s | Default Media Receiver buffering |
@@ -115,6 +115,8 @@ also when zooming in: the Mac scales its 3456 pixels down to ~2300, and that det
 (`--max-qp 24` doesn't change it). Sending more pixels failed: 4112x2658 is beyond H.264 (VideoToolbox refuses),
 3564x2304 is beyond the iPad's hardware decoder (Safari fell back to software, under 1 fps), and 3340x2160 came
 out of the encoder at 2 fps. Casting a single window (`--window`) at most the iPad's size avoids the downscale.
+
+Casting a single window to the iPad is faster still: about 40 ms, without lost frames.
 
 On an iPhone 17 (Safari, home screen app): 2250x954 inside the safe area, 57 fps. **Extend** at Retina size
 (1396x540 points, 2792x1080 pixels): about 45 fps with 0 lost frames; the Mac only sends a frame when the screen
