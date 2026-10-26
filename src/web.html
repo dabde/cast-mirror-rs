@@ -268,6 +268,7 @@
   const VERSION = "__PAGE_VERSION__";
   let ws = null;
   let pc = null;
+  let heard = 0;
   let channel = null;
   let worker = null;
 
@@ -286,6 +287,7 @@
   }
 
   function onData(data) {
+    heard = Date.now();
     if (typeof data === "string") {
       if (data[0] === "p") {
         sendUp("e" + data.slice(1));
@@ -325,14 +327,23 @@
       startWebRtc().catch((e) => console.warn("WebRTC", e));
     };
     ws.onmessage = (e) => onData(e.data);
-    ws.onclose = () => {
-      show("Disconnected. Retrying…");
-      pc?.close();
-      pc = channel = null;
-      worker.postMessage({reset: true});
-      setTimeout(connect, 1000);
-    };
+    ws.onclose = lost;
   }
+
+  function lost() {
+    heard = 0;
+    ws.onclose = null;
+    ws.close();
+    show("Disconnected. Retrying…");
+    pc?.close();
+    pc = channel = null;
+    worker.postMessage({reset: true});
+    setTimeout(connect, 1000);
+  }
+  // The Mac pings every 200 ms while streaming; iOS often never fires close on a dropped connection.
+  setInterval(() => {
+    if (heard && Date.now() - heard > 3000) lost();
+  }, 500);
 
   // Keep the screen on while watching; the lock is released whenever the page is hidden.
   async function keepAwake() {
