@@ -96,8 +96,9 @@ and JDK 17; `android/build.sh install <ip>` also installs and starts it over ADB
 
 ## More
 
-[docs/technical.md](docs/technical.md) has the protocol details, latency measurements, encryption and pairing,
-and the test setup with Open Screen's reference receiver.
+- [docs/performance.md](docs/performance.md): latency per receiver, how it was measured, per-stage timings.
+- [docs/technical.md](docs/technical.md): protocol details, encryption and pairing, and the test setup with
+  Open Screen's reference receiver.
 
 ## License
 
