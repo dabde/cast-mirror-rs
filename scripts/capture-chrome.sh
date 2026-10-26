@@ -1,9 +1,9 @@
-#!/bin/zsh
+# Technical notes
 # Record a Chrome "Cast screen" session to a receiver and summarise it.
 # Once: brew install --cask wireshark-chmodbpf  (admin password; gives non-root capture access)
 # Usage: scripts/capture-chrome.sh RECEIVER_IP [SECONDS]  (your normal Chrome can stay open)
 set -eu
-ip=${1:?receiver IP, e.g. 192.168.177.56}
+ip=${1:?receiver IP, e.g. 192.168.1.50}
 secs=${2:-60}
 out=${OUT:-capture-$(date +%Y%m%d-%H%M%S)}
 mkdir -p $out

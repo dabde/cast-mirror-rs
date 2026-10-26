@@ -23,7 +23,7 @@ cat > $app/Contents/Info.plist <<'PLIST'
 </dict></plist>
 PLIST
 # macOS ties the Screen Recording permission to the signature. An ad-hoc one changes with every build,
-# so the permission is lost each time; a fixed certificate keeps it (see README, "Signing").
+# so the permission is lost each time; a fixed certificate keeps it (see docs/technical.md, "Signing").
 identity="CastMirror Local Signing"
 if security find-identity -p codesigning | grep -q "\"$identity\""; then
   codesign --force --deep -s "$identity" $app

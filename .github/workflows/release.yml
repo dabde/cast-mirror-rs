@@ -1,0 +1,48 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  tv-app:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - name: TV app
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+        run: |
+          # A fixed key lets `adb install -r` update an installed app; without the secret each release gets a new one.
+          [ -z "$ANDROID_KEYSTORE" ] || echo "$ANDROID_KEYSTORE" | base64 -d > android/debug.keystore
+          sudo apt-get install -y zsh
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "build-tools;34.0.0" "platforms;android-34" >/dev/null
+          android/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: android/cast-mirror-receiver.apk
+
+  release:
+    needs: tv-app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Mac app
+        run: |
+          scripts/bundle-app.sh $PWD/dist/CastMirror.app
+          ditto -c -k --keepParent dist/CastMirror.app dist/CastMirror-macos-arm64.zip
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: dist
+      - run: gh release create ${{ github.ref_name }} --generate-notes dist/CastMirror-macos-arm64.zip dist/cast-mirror-receiver.apk
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -1,8 +1,8 @@
-#!/bin/zsh
+# Technical notes
 # Mirror with several settings; screenshot the lag wheel next to a webcam view of the TV (e.g. Photo Booth).
 # Usage: scripts/lag-sweep.sh DEVICE [OUTDIR [CONFIG...]]   (~25 s each; CONFIG = "name --flags...")
 set -u
-dev=${1:?device, e.g. 192.168.177.56}
+dev=${1:?device, e.g. 192.168.1.50}
 out=${2:-lag-sweep-$(date +%Y%m%d-%H%M%S)}
 mkdir -p $out
 bin=${0:A:h:h}/target/release/cast-mirror

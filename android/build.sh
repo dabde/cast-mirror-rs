@@ -1,4 +1,4 @@
-#!/bin/zsh
+# Technical notes
 # Builds and signs the Android TV receiver without Gradle. Optional: ./build.sh install HOST
 set -eu
 cd ${0:A:h}
@@ -28,7 +28,7 @@ $bt/apksigner sign --ks debug.keystore --ks-pass pass:android --out cast-mirror-
 echo "Built android/cast-mirror-receiver.apk"
 
 if [ "${1:-}" = install ]; then
-  host=${2:?TV address, e.g. 192.168.177.56}
+  host=${2:?TV address, e.g. 192.168.1.50}
   adb connect $host:5555 >/dev/null
   adb -s $host:5555 install -r cast-mirror-receiver.apk
   adb -s $host:5555 shell am start -n de.tisth.castmirror/.MainActivity

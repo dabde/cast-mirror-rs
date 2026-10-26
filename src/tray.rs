@@ -32,7 +32,7 @@ struct Profile {
     auto: bool,
 }
 
-// Measured on a Philips TPM191E and a Chromecast on its HDMI input; see README.
+// Measured on a Philips TPM191E and a Chromecast on its HDMI input; see docs/technical.md.
 const PROFILES: [Profile; 6] = [
     Profile { name: "Lowest latency", detail: "Chromecast, 60 ms buffer", delay: 60, fps: 30, width: 1920, bitrate: 6_000_000, auto: false },
     Profile { name: "Balanced", detail: "100 ms buffer", delay: 100, fps: 30, width: 1920, bitrate: 6_000_000, auto: false },

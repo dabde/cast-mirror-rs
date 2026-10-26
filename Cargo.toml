@@ -2,6 +2,8 @@
 name = "cast-mirror"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+repository = "https://github.com/dabde/cast-mirror-rs"
 
 [dependencies]
 anyhow = "1.0.104"
