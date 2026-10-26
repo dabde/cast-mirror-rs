@@ -10,7 +10,7 @@ cargo build --release
 ./target/release/cast-mirror launch tv         # start the mirroring app (0F5096E8) and exit
 ./target/release/cast-mirror pattern tv        # solid colour changing every second
 ./target/release/cast-mirror tv --stats        # mirror display 0 with audio
-./target/release/cast-mirror tv --window brave # only that window (and only its app's audio)
+./target/release/cast-mirror tv --window safari # only that window (and only its app's audio)
 ```
 
 Options: `--fps 30 --bitrate 6M --width 1920 --delay 100 --no-audio --display N --window TEXT --stats`,
@@ -70,7 +70,7 @@ gets a slightly larger display that the capture scales down a few percent.
 picture clear of a notch or the iPhone's island (the safe area) and reports that area as its view.
 In the menu bar app, pick **Browser (iPad, laptop…)** as receiver: the window shows the link and a QR code to scan
 with the iPad camera, and Screen or Window… starts serving (60 fps, 20 Mbit/s). The page reports its screen in pixels and the Mac
-captures to fit exactly that (2314x1494 for an iPad Pro 11" in Safari), so the picture isn't scaled twice. The certificate is self-signed (the browser asks
+captures to fit exactly that, so the picture isn't scaled twice. The certificate is self-signed (the browser asks
 once); the token in the link is the access check.
 
 Video goes over a WebRTC data channel (UDP, via str0m on the Mac as ICE-lite peer), opened unordered with at most
@@ -78,7 +78,7 @@ Video goes over a WebRTC data channel (UDP, via str0m on the Mac as ICE-lite pee
 H.264 High in a worker (WebCodecs, hardware) and draws to a canvas; frames carry a number so it can put them back
 in order, and a frame still missing after 120 ms (or once a newer key frame is there) is given up for a key frame.
 
-Measurements: [performance.md](performance.md#browser).
+Measurements: [performance.md](performance.md).
 
 ## Layout
 
@@ -123,7 +123,7 @@ android/build.sh install 192.168.1.50        # build, install over adb, start
 cast-mirror 192.168.1.50 --direct --codecs hevc --fps 60
 ```
 
-Measurements: [performance.md](performance.md#tv-app-direct-mode).
+Measurements: [performance.md](performance.md).
 
 **Encryption (protocol v3):** every packet in both directions is AES-128-GCM sealed: payload encrypted,
 header authenticated, a counter per packet as nonce, so resends get fresh nonces. The session key always comes

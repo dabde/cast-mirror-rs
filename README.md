@@ -79,7 +79,7 @@ The app's binary also works in a terminal (it needs the Screen Recording permiss
 
 ```sh
 cast-mirror scan                          # list Cast receivers
-cast-mirror "Living Room" --stats         # mirror display 0 to a Cast device, with live stats
+cast-mirror "TV" --stats                  # mirror display 0 to a Cast device, with live stats
 cast-mirror tv --window safari            # only one window
 cast-mirror 192.168.1.50 --direct --fps 60 --codecs hevc   # to the TV app
 cast-mirror pair 192.168.1.50             # pair with the TV app once
@@ -96,7 +96,7 @@ and JDK 17; `android/build.sh install <ip>` also installs and starts it over ADB
 
 ## More
 
-- [docs/performance.md](docs/performance.md): latency per receiver, how it was measured, per-stage timings.
+- [docs/performance.md](docs/performance.md): latency per receiver and what it depends on.
 - [docs/technical.md](docs/technical.md): protocol details, encryption and pairing, and the test setup with
   Open Screen's reference receiver.
 
