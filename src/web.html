@@ -81,6 +81,13 @@
   const queued = new Map();
 
   const up = (text) => postMessage({up: text});
+  // A lost key frame leaves nothing to decode until the next one: keep asking while waiting.
+  let askedKey = 0;
+  function askKey() {
+    if (performance.now() - askedKey < 500) return;
+    askedKey = performance.now();
+    up("k");
+  }
   const isKey = (buffer) => (new Uint8Array(buffer, 0, 1)[0] & 1) === 1;
 
   // "avc1.PPCCLL" from the SPS (NAL type 7) the key frame starts with.
@@ -133,7 +140,8 @@
     configured = false;
     pending.clear();
     partial.clear();
-    up("k");
+    askedKey = 0;
+    askKey();
   }
 
   function decodeOne(buffer) {
@@ -164,7 +172,10 @@
   function drain() {
     if (expected === null) {
       const keys = [...pending.keys()].filter((id) => isKey(pending.get(id)));
-      if (!keys.length) return;
+      if (!keys.length) {
+        askKey();
+        return;
+      }
       // The newest key frame: older ones only show the past.
       expected = Math.max(...keys);
       for (const id of pending.keys()) if (id < expected) pending.delete(id);
